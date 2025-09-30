@@ -1,4 +1,4 @@
-// main.cpp — Display + Audio (ES8311 + I2S) + Vario beeper + CST92xx touch + BMP280 baro
+// main.cpp — Display + Audio (ES8311 + I2S) + Vario beeper + CST92xx touch + BMP280 baro (Kalman + deadband)
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -14,7 +14,7 @@
 #endif
 #include <TFT_eSPI.h>
 
-// Your custom display and touch headers
+// Custom display and touch headers
 #include "display/CO5300.h"
 #include "touch/TouchDrvCST92xx.h"
 
@@ -128,10 +128,10 @@ Adafruit_BMP280 g_bmp(&Wire1);
 bool            g_bmp_ok = false;
 float           g_qnh_hpa = 1013.25f; // default QNH, tweak later via Settings
 
-// Baro-derived state
+// Baro-derived state (legacy outputs fed by filter)
 static float    g_alt_m_last = NAN;     // last raw altitude (m)
-static float    g_alt_m_lp   = NAN;     // low-pass altitude (m)
-static float    g_v_mps      = 0.0f;    // filtered vertical speed (m/s)
+static float    g_alt_m_lp   = NAN;     // smoothed altitude (m)
+static float    g_v_mps      = 0.0f;    // smoothed vertical speed (m/s)
 static uint32_t g_baro_last_ms = 0;
 
 // Colors
@@ -388,7 +388,7 @@ private:
   void        drawCenterValue(TFT_eSprite& s) const;
 };
 
-// -- Vario rendering orchestration (defined after helpers so all are visible)
+// -- Vario rendering orchestration
 void Vario::draw(TFT_eSprite& s) {
   drawBand(s);
   drawCaps(s);
@@ -569,7 +569,7 @@ void Vario::drawCenterValue(TFT_eSprite& s) const {
   snprintf(buf, sizeof(buf), "%+.1f", v_);
   uint16_t color = (v_ >= 0.0f) ? C_GREEN : C_RED;
   drawTextCentered(s, buf, x, y, 6, color);
-};
+}
 
 class Altimeter {
 public:
@@ -682,6 +682,122 @@ static void handleSettingsTouch(int16_t x, int16_t y) {
 }
 
 // ===================================================================
+// =================== Kalman Filter (Altitude/Velocity/Bias) ========
+// ===================================================================
+
+struct BaroKalman {
+  // state: [z, v, b] = [altitude (m), vertical speed (m/s), measurement bias (m)]
+  float z = 0.f, v = 0.f, b = 0.f;
+  float P[3][3] = { {1,0,0},{0,1,0},{0,0,1} };
+
+  // tunables (variances)
+  float qz = 0.01f;   // position process noise (m^2 / s)
+  float qv = 0.15f;   // velocity process noise ((m/s)^2 / s)
+  float qb = 0.0001f; // bias random-walk (m^2 / s)
+  float r  = 0.36f;   // measurement noise (m^2) => 0.6 m RMS
+
+  void init(float z0) {
+    z = z0; v = 0.f; b = 0.f;
+    P[0][0]=10.f; P[0][1]=0;    P[0][2]=0;
+    P[1][0]=0;    P[1][1]=1.f;  P[1][2]=0;
+    P[2][0]=0;    P[2][1]=0;    P[2][2]=1.f;
+  }
+
+  void setNoise(float _qz, float _qv, float _qb, float _r) { qz=_qz; qv=_qv; qb=_qb; r=_r; }
+
+  void predict(float dt) {
+    // x = A x, A = [[1,dt,0],[0,1,0],[0,0,1]]
+    z += v * dt;
+
+    // P = A P A^T + Q
+    float P00=P[0][0], P01=P[0][1], P02=P[0][2];
+    float P10=P[1][0], P11=P[1][1], P12=P[1][2];
+    float P20=P[2][0], P21=P[2][1], P22=P[2][2];
+
+    // A P
+    float AP00 = P00 + dt*P10;
+    float AP01 = P01 + dt*P11;
+    float AP02 = P02 + dt*P12;
+
+    float AP10 = P10;
+    float AP11 = P11;
+    float AP12 = P12;
+
+    float AP20 = P20;
+    float AP21 = P21;
+    float AP22 = P22;
+
+    // (A P) A^T
+    P[0][0] = AP00 + dt*AP10;
+    P[0][1] = AP01 + dt*AP11;
+    P[0][2] = AP02 + dt*AP12;
+
+    P[1][0] = AP10;
+    P[1][1] = AP11;
+    P[1][2] = AP12;
+
+    P[2][0] = AP20;
+    P[2][1] = AP21;
+    P[2][2] = AP22;
+
+    // add Q
+    P[0][0] += qz * dt;
+    P[1][1] += qv * dt;
+    P[2][2] += qb * dt;
+
+    // enforce symmetry
+    P[1][0] = P[0][1];
+    P[2][0] = P[0][2];
+    P[2][1] = P[1][2];
+  }
+
+  void update(float z_meas) {
+    // y = z_meas = [1 0 1] * [z v b]^T + noise
+    float y = z_meas - (z + b);
+
+    // S = H P H^T + R = Pzz + 2*Pzb + Pbb + r
+    float Pzz=P[0][0], Pzb=P[0][2], Pbb=P[2][2];
+    float S = Pzz + 2.f*Pzb + Pbb + r;
+    if (S <= 1e-6f) S = 1e-6f;
+    float invS = 1.0f / S;
+
+    // K = P H^T / S, H^T=[1,0,1]^T
+    float Kz = (P[0][0] + P[0][2]) * invS;
+    float Kv = (P[1][0] + P[1][2]) * invS;
+    float Kb = (P[2][0] + P[2][2]) * invS;
+
+    // state update
+    z += Kz * y;
+    v += Kv * y;
+    b += Kb * y;
+
+    // covariance update
+    float HP0 = P[0][0] + P[2][0];
+    float HP1 = P[0][1] + P[2][1];
+    float HP2 = P[0][2] + P[2][2];
+
+    float P00 = P[0][0] - Kz*HP0; float P01 = P[0][1] - Kz*HP1; float P02 = P[0][2] - Kz*HP2;
+    float P10 = P[1][0] - Kv*HP0; float P11 = P[1][1] - Kv*HP1; float P12 = P[1][2] - Kv*HP2;
+    float P20 = P[2][0] - Kb*HP0; float P21 = P[2][1] - Kb*HP1; float P22 = P[2][2] - Kb*HP2;
+
+    P[0][0]=P00; P[0][1]=P01; P[0][2]=P02;
+    P[1][0]=P10; P[1][1]=P11; P[1][2]=P12;
+    P[2][0]=P20; P[2][1]=P21; P[2][2]=P22;
+
+    // enforce symmetry
+    P[1][0] = P[0][1] = 0.5f*(P[1][0]+P[0][1]);
+    P[2][0] = P[0][2] = 0.5f*(P[2][0]+P[0][2]);
+    P[2][1] = P[1][2] = 0.5f*(P[2][1]+P[1][2]);
+  }
+};
+
+// Global KF instance + deadband for UI/audio
+static BaroKalman g_kf;
+#ifndef V_DEADBAND
+static const float V_DEADBAND = 0.15f;  // clamp tiny jiggle to zero (m/s)
+#endif
+
+// ===================================================================
 // =================== BMP280 Helpers ================================
 // ===================================================================
 
@@ -696,45 +812,43 @@ static void baro_begin() {
   }
   if (!g_bmp_ok) { Serial.println("[BARO] ✗ No BMP280 detected"); return; }
 
-// Configure sampling: normal mode, decent oversampling, strong IIR
-g_bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                  Adafruit_BMP280::SAMPLING_X16,   // temperature oversampling
-                  Adafruit_BMP280::SAMPLING_X2,    // pressure oversampling
-                  Adafruit_BMP280::FILTER_X16      // IIR filter
-                  /* standby left at library default (often 125 ms) */);
-  Serial.println("[BARO] ✓ BMP280 ready");
+  // Configure sampling (leave standby at library default)
+  g_bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                    Adafruit_BMP280::SAMPLING_X16,  // temp
+                    Adafruit_BMP280::SAMPLING_X2,   // pressure
+                    Adafruit_BMP280::FILTER_X16);   // IIR
+
+  // Prime the filter with the first altitude
+  float z0 = g_bmp.readAltitude(g_qnh_hpa);
+  if (isnan(z0)) z0 = 0.f;
+  g_kf.init(z0);
+  g_alt_m_lp     = z0;
+  g_v_mps        = 0.f;
+  g_baro_last_ms = millis();
+
+  Serial.println("[BARO] ✓ BMP280 ready + Kalman initialized");
 }
 
 static void baro_update() {
   if (!g_bmp_ok) return;
+
   uint32_t now = millis();
-  if (g_baro_last_ms == 0) {
-    g_baro_last_ms = now;
-    (void)g_bmp.readPressure();
-    g_alt_m_last = g_bmp.readAltitude(g_qnh_hpa);
-    g_alt_m_lp = g_alt_m_last;
-    return;
-  }
-  float dt = (now - g_baro_last_ms) * 0.001f; if (dt <= 0.0f) dt = 1e-3f;
-
-  // Read latest sample(s)
-  (void)g_bmp.readTemperature(); // not used yet; can trigger internal refresh on some variants
-  float alt_m = g_bmp.readAltitude(g_qnh_hpa);
-  if (!isnan(alt_m)) {
-    // Low-pass altitude for altimeter
-    const float tau_alt = 0.8f; // seconds
-    float alpha_alt = dt / (tau_alt + dt);
-    g_alt_m_lp = isnan(g_alt_m_lp) ? alt_m : (g_alt_m_lp + alpha_alt * (alt_m - g_alt_m_lp));
-
-    // Differentiate raw altitude for vario, then low-pass the velocity
-    float v_inst = (isnan(g_alt_m_last)) ? 0.0f : (alt_m - g_alt_m_last) / dt;
-    const float tau_v = 0.40f; // seconds
-    float beta_v = dt / (tau_v + dt);
-    g_v_mps = g_v_mps + beta_v * (v_inst - g_v_mps);
-
-    g_alt_m_last = alt_m;
-  }
+  float dt = (now - g_baro_last_ms) * 0.001f;
+  if (dt <= 0.f) dt = 1e-3f;
   g_baro_last_ms = now;
+
+  // Measurement
+  (void)g_bmp.readTemperature(); // keep sensor fresh
+  float z_meas = g_bmp.readAltitude(g_qnh_hpa);
+  if (isnan(z_meas)) return;
+
+  // Predict + Update
+  g_kf.predict(dt);
+  g_kf.update(z_meas);
+
+  // Publish filtered outputs
+  g_alt_m_lp = g_kf.z;   // m
+  g_v_mps    = g_kf.v;   // m/s
 }
 
 // ===================================================================
@@ -785,19 +899,39 @@ void loop() {
   // Update baro (if present)
   baro_update();
 
-  // Signals
-  float v;
-  float alt_ft;
+  // --- Signals from sensors ---
+  float v;       // m/s
+  float alt_ft;  // feet
   if (g_bmp_ok) {
-    v = g_v_mps;                                 // m/s for vario + audio
-    alt_ft = (isnan(g_alt_m_lp) ? 0.0f : g_alt_m_lp) * 3.28084f;  // display in feet
+    v = g_v_mps;
+    alt_ft = (isnan(g_alt_m_lp) ? 0.0f : g_alt_m_lp) * 3.28084f;
   } else {
     // Fallback demo if no baro connected
     v = (5.0f * KTS_TO_MPS) * sinf(t * 0.6f);
     alt_ft = 3962.0f + 7.0f * sinf(t * 0.12f) + 0.5f * sinf(t * 0.6f);
   }
 
-  static float asi_val = 55.f; // still demo for ASI until airspeed sensor is added
+  // OPTIONAL: median-of-3 to suppress one-sample spikes
+  static float v_hist[3] = {0,0,0};
+  static int   v_idx = 0;
+  v_hist[v_idx] = v;
+  v_idx = (v_idx + 1) % 3;
+  auto median3f = [](float a,float b,float c){
+    if (a>b) { float t=a; a=b; b=t; }
+    if (b>c) { float t=b; b=c; c=t; }
+    if (a>b) { float t=a; a=b; b=t; }
+    return b;
+  };
+  float v_med = median3f(v_hist[0], v_hist[1], v_hist[2]);
+
+  // Deadband for both audio AND UI
+  float v_disp = (fabsf(v_med) < V_DEADBAND) ? 0.0f : v_med;
+
+  // Audio vario
+  audioManager.setVario(v_disp);
+
+  // Simulated ASI until airspeed sensor lands
+  static float asi_val = 55.f;
   static uint32_t lastAsi = 0;
   if (millis() - lastAsi > 100) {
     lastAsi = millis();
@@ -805,9 +939,6 @@ void loop() {
     asi_val += delta10 / 10.0f;
     asi_val = constrain(asi_val, 45.0f, 65.0f);
   }
-
-  // Audio vario
-  audioManager.setVario(v);
 
   // Touch & swipe
   if (g_touch_initialized) {
@@ -830,8 +961,8 @@ void loop() {
     }
   }
 
-  // Render
-  if (g_in_settings) drawSettingsScreen(); else drawMainScreen(v, alt_ft, asi_val);
+  // Render (feed v_disp to vario UI)
+  if (g_in_settings) drawSettingsScreen(); else drawMainScreen(v_disp, alt_ft, asi_val);
 
   // Debug
   if (millis() - last_debug > 5000) {
@@ -840,7 +971,7 @@ void loop() {
                   g_touch_initialized ? "OK" : "FAIL",
                   g_in_settings ? "SETTINGS" : "MAIN",
                   g_bmp_ok ? "OK" : "-",
-                  v, alt_ft);
+                  v_disp, alt_ft);
   }
 
   delay(16);
