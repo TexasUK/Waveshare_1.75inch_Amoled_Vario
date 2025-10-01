@@ -1,5 +1,7 @@
 // main.cpp — ESP32-S3 Round Instrument Cluster
-// Display + Audio (ES8311 + I2S) + Vario beeper + CST92xx touch + BMP388 baro (Kalman + warmup + deadband)
+// Display + Audio (ES8311 + I2S) + Vario beeper + CST92xx touch
+// Baro: Adafruit BMP388 (BMP3XX) on Wire1 with Kalman, warmup, deadband
+// Adds: Calibration screen (QNH/QFE/Field Elevation), persistence, UI smoothing
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -23,16 +25,11 @@
 #include "system/SettingsManager.h"
 #include "driver/audio/AudioManager.h"
 
-// FreeRTOS for audio task
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/semphr.h"
-
-// I2S and codec
+// I2S / codec
 #include "driver/i2s.h"
 #include "driver/audio/es8311.h"
 
-// -------- BMP388 / BMP3XX ----------
+// Baro
 #include <Adafruit_BMP3XX.h>
 
 #ifndef M_PI
@@ -112,25 +109,29 @@ static constexpr float KTS_TO_MPS = 0.514444f;
 #endif
 
 // ===================================================================
-// =================== Global Objects ================================
+// =================== Global Objects & State ========================
 // ===================================================================
 
 TFT_eSPI    tft;
 TFT_eSprite spr(&tft);
 TouchDrvCST92xx g_touch;
 
-// Managers
 SettingsManager settingsManager;
 AudioManager   audioManager;
 
-// ---- BMP388 (BMP3XX) on Wire1 ----
+// Preferences for calibration data
+Preferences cal_prefs;
+
+// BMP388 (BMP3XX) on Wire1
 Adafruit_BMP3XX g_bmp;
 bool            g_bmp_ok = false;
-float           g_qnh_hpa = 1013.25f; // default QNH
+float           g_qnh_hpa = 1013.25f;    // persisted
+float           g_alt_offset_m = 0.0f;   // persisted: display-only offset (QFE)
 
-// Baro-derived state
-static float    g_alt_m_lp   = NAN;     // filtered altitude (m)
-static float    g_v_mps      = 0.0f;    // filtered vertical speed (m/s)
+// Live baro state
+static float    g_alt_m_lp   = NAN;      // filtered altitude (m) from Kalman
+static float    g_v_mps      = 0.0f;     // filtered vertical speed (m/s)
+static float    g_p_hpa      = NAN;      // latest pressure (hPa)
 static uint32_t g_baro_last_ms = 0;
 
 // Colors
@@ -141,22 +142,30 @@ static const uint16_t C_GREEN  = 0x07E0;
 static const uint16_t C_LGREY  = 0xC618;
 static const uint16_t C_BLUE   = 0x001F;
 static const uint16_t C_YELLOW = 0xFFE0;
+static const uint16_t C_DGREY  = 0x7BEF;
 
-// Application state
+// App screens
 bool     g_touch_initialized = false;
 bool     g_in_settings = false;
+bool     g_in_calib    = false;
 uint32_t g_last_touch_time = 0;
 
-// Settings screen state
+// Settings screen cursor
 struct SettingsScreenState {
-  bool calibrating = false;
-  int  selected_setting = 0;    // 0=volume, 1=brightness, 2=units, 3=calibration
+  bool calibrating = false;      // legacy flag; now we use g_in_calib
+  int  selected_setting = 0;     // 0=volume,1=brightness,2=units,3=calibration
 } g_settings_screen;
 
-// ===================================================================
-// =================== Settings Slider ===============================
-// ===================================================================
+// Calibration screen state
+static float g_field_target_ft = 0.0f;   // for "Set Field Elevation" UI
 
+// UI needle smoothing
+static float g_vario_ui = 0.0f;          // EMA for display-only smoothing
+
+// Soft start gate
+static uint32_t g_baro_mute_until_ms = 0;
+
+// Slider (for settings volume/brightness)
 struct SliderState {
   bool active = false;
   int  value = 0;
@@ -169,7 +178,7 @@ struct SliderState {
 } g_slider;
 
 // ===================================================================
-// =================== Touch System ==================================
+// =================== Touch =========================================
 // ===================================================================
 
 static inline bool valid_gpio(int pin) { return pin >= 0 && pin <= 48; }
@@ -196,10 +205,7 @@ static bool touch_begin() {
 
   for (uint8_t a : try_addrs) {
     Serial.printf("[TOUCH] Trying address 0x%02X.", a);
-    if (valid_gpio(TOUCH_RST_PIN)) {
-      digitalWrite(TOUCH_RST_PIN, LOW); delay(5);
-      digitalWrite(TOUCH_RST_PIN, HIGH); delay(50);
-    }
+    if (valid_gpio(TOUCH_RST_PIN)) { digitalWrite(TOUCH_RST_PIN, LOW); delay(5); digitalWrite(TOUCH_RST_PIN, HIGH); delay(50); }
     if (g_touch.begin(Wire, a, I2C_SDA_PIN, I2C_SCL_PIN)) {
       Serial.printf(" SUCCESS\n");
       touch_found = true;
@@ -215,11 +221,7 @@ static bool touch_begin() {
     delay(50);
   }
 
-  if (!touch_found) {
-    Serial.println("[TOUCH] No touch controller found!");
-    return false;
-  }
-
+  if (!touch_found) { Serial.println("[TOUCH] No touch controller found!"); return false; }
   Serial.println("[TOUCH] Touch initialized successfully");
   return true;
 }
@@ -280,7 +282,7 @@ static const int ASI_LABEL_W     = 3 * (6 * ASI_KTS_FONT);
 static const int ASI_LINE_W      = ASI_FIELD_W + ASI_GUTTER + ASI_LABEL_W;
 
 // ===================================================================
-// =================== UI Helper Functions ===========================
+// =================== UI Helpers ====================================
 // ===================================================================
 
 static inline void getBandRadii(int &rDisplay, int &rOuter, int &rInner, int &rCenter) {
@@ -300,7 +302,7 @@ static inline float varioAngleDeg(float v) {
   return 180.0f + s * d;
 }
 
-static inline void drawTextCentered(TFT_eSprite& s,const char* str,int x,int y,int size,uint16_t fg,uint16_t bg=C_BLACK){
+static inline void drawTextCentered(TFT_eSprite& s, const char* str, int x, int y, int size, uint16_t fg, uint16_t bg=C_BLACK) {
   s.setTextWrap(false);
   s.setTextColor(fg, bg);
   s.setTextSize(size);
@@ -310,10 +312,6 @@ static inline void drawTextCentered(TFT_eSprite& s,const char* str,int x,int y,i
   s.print(str);
 }
 
-// ===================================================================
-// =================== Slider Functions ==============================
-// ===================================================================
-
 static void drawRoundedRect(TFT_eSprite& s, int x, int y, int w, int h, int r, uint16_t color) {
   s.fillCircle(x + r, y + r, r, color);
   s.fillCircle(x + w - r - 1, y + r, r, color);
@@ -322,6 +320,20 @@ static void drawRoundedRect(TFT_eSprite& s, int x, int y, int w, int h, int r, u
   s.fillRect(x + r, y, w - 2 * r, h, color);
   s.fillRect(x, y + r, w, h - 2 * r, color);
 }
+
+// Simple buttons
+static void drawButton(TFT_eSprite& s, int x, int y, int w, int h, const char* label, uint16_t fg, uint16_t bg) {
+  s.fillRect(x, y, w, h, bg);
+  s.drawRect(x, y, w, h, C_WHITE);
+  drawTextCentered(s, label, x + w/2, y + h/2, 2, fg, bg);
+}
+static bool hit(int16_t x, int16_t y, int rx, int ry, int rw, int rh) {
+  return (x >= rx && x <= rx + rw && y >= ry && y <= ry + rh);
+}
+
+// ===================================================================
+// =================== Settings Slider ===============================
+// ===================================================================
 
 static void drawSlider() {
   int slider_radius = g_slider.height / 2;
@@ -364,17 +376,16 @@ static void setupSlider() {
 }
 
 // ===================================================================
-// =================== UI Classes ====================================
+// =================== UI Classes (Vario/Alt/ASI) ====================
 // ===================================================================
 
 class Vario {
 public:
   void update(float v) { v_ = v; }
-  void draw(TFT_eSprite& s);  // defined after the class
+  void draw(TFT_eSprite& s);
 
 private:
   float v_ = 0.f;
-
   static void fillDiskVertical(TFT_eSprite& s, int cx, int cy, int r, uint16_t color);
   static void drawBand(TFT_eSprite& s);
   static void drawCaps(TFT_eSprite& s);
@@ -393,7 +404,6 @@ void Vario::draw(TFT_eSprite& s) {
   drawLabels(s);
   drawCenterValue(s);
 }
-
 void Vario::fillDiskVertical(TFT_eSprite& s, int cx, int cy, int r, uint16_t color) {
   if (r < 1) return;
   const long r2 = 1L * r * r;
@@ -410,159 +420,87 @@ void Vario::fillDiskVertical(TFT_eSprite& s, int cx, int cy, int r, uint16_t col
     if (h > 0) { s.fillRect(x, yTop, 1, h, color); }
   }
 }
-
 void Vario::drawBand(TFT_eSprite& s) {
-  const int cx = LCD_W / 2;
-  const int cy = LCD_H / 2;
-  int rDisplay, rOuter, rInner, rCenter;
-  getBandRadii(rDisplay, rOuter, rInner, rCenter);
-
-  const long rO2 = 1L * rOuter * rOuter;
-  const long rI2 = 1L * rInner * rInner;
-
-  int y0 = max(0, cy - rOuter);
-  int y1 = min(LCD_H - 2, cy + rOuter);
-  if (y0 & 1) y0++;
-
+  const int cx = LCD_W / 2, cy = LCD_H / 2;
+  int rDisplay, rOuter, rInner, rCenter; getBandRadii(rDisplay, rOuter, rInner, rCenter);
+  const long rO2 = 1L * rOuter * rOuter, rI2 = 1L * rInner * rInner;
+  int y0 = max(0, cy - rOuter), y1 = min(LCD_H - 2, cy + rOuter); if (y0 & 1) y0++;
   for (int y = y0; y <= y1; y += 2) {
-    long dy  = (long)y - cy;
-    long dy2 = dy * dy;
-    if (dy2 > rO2) continue;
-
+    long dy  = (long)y - cy, dy2 = dy * dy; if (dy2 > rO2) continue;
     int halfOuter = (int)floorf((float)sqrt((double)(rO2 - dy2)));
     int halfInner = (dy2 < rI2) ? (int)floorf((float)sqrt((double)(rI2 - dy2))) : 0;
-
-    int x = cx - halfOuter;
-    int w = (cx - halfInner) - x;
+    int x = cx - halfOuter; int w = (cx - halfInner) - x;
     if (x < 0) { w += x; x = 0; }
     if (x + w > LCD_W) { w = LCD_W - x; }
     if (w > 0) { s.fillRect(x, y, w, 2, C_WHITE); }
   }
 }
-
 void Vario::drawCaps(TFT_eSprite& s) {
-  const int cx = LCD_W / 2;
-  const int cy = LCD_H / 2;
-  int rDisplay, rOuter, rInner, rCenter;
-  getBandRadii(rDisplay, rOuter, rInner, rCenter);
-
+  const int cx = LCD_W / 2, cy = LCD_H / 2;
+  int rDisplay, rOuter, rInner, rCenter; getBandRadii(rDisplay, rOuter, rInner, rCenter);
   int rCap = max(1, BAND_W / 2);
   fillDiskVertical(s, cx, cy - rCenter, rCap, C_WHITE);
   fillDiskVertical(s, cx, cy + rCenter, rCap, C_WHITE);
 }
-
 void Vario::drawRadialAt(TFT_eSprite& s, float angleDeg, uint16_t color, int thickness) {
-  const int cx = LCD_W / 2;
-  const int cy = LCD_H / 2;
-  float rad = angleDeg * (float)M_PI / 180.0f;
-  float ux = cosf(rad), uy = sinf(rad);
-
-  int rDisplay, rOuter, rInner, rCenter;
-  getBandRadii(rDisplay, rOuter, rInner, rCenter);
-
+  const int cx = LCD_W / 2, cy = LCD_H / 2;
+  float rad = angleDeg * (float)M_PI / 180.0f, ux = cosf(rad), uy = sinf(rad);
+  int rDisplay, rOuter, rInner, rCenter; getBandRadii(rDisplay, rOuter, rInner, rCenter);
   int half = max(1, thickness / 2);
   for (int r = rInner; r <= rOuter; ++r) {
-    int x = cx + (int)lroundf(ux * r);
-    int y = cy + (int)lroundf(uy * r);
+    int x = cx + (int)lroundf(ux * r), y = cy + (int)lroundf(uy * r);
     int x0 = x - half, y0 = y - half, w = thickness, h = thickness;
-
-    if (x0 < 0) { w += x0; x0 = 0; }
-    if (y0 < 0) { h += y0; y0 = 0; }
-    if (x0 + w > LCD_W)  { w = LCD_W  - x0; }
-    if (y0 + h > LCD_H)  { h = LCD_H  - y0; }
+    if (x0 < 0) { w += x0; x0 = 0; } if (y0 < 0) { h += y0; y0 = 0; }
+    if (x0 + w > LCD_W)  { w = LCD_W  - x0; } if (y0 + h > LCD_H)  { h = LCD_H  - y0; }
     if (w > 0 && h > 0) { s.fillRect(x0, y0, w, h, color); }
   }
 }
-
 void Vario::drawRadials(TFT_eSprite& s) {
   drawRadialAt(s, varioAngleDeg(0.0f), C_BLACK, RADIAL_TK_MAJOR);
-  const int ticks[] = {2, 4, 6, 8};
-  for (int i = 0; i < 4; ++i) {
-    int v = ticks[i];
-    drawRadialAt(s, varioAngleDeg(+v), C_BLACK, RADIAL_TK_MINOR);
-    drawRadialAt(s, varioAngleDeg(-v), C_BLACK, RADIAL_TK_MINOR);
-  }
+  const int ticks[] = {2,4,6,8};
+  for (int i=0;i<4;++i){int v=ticks[i]; drawRadialAt(s,varioAngleDeg(+v),C_BLACK,RADIAL_TK_MINOR); drawRadialAt(s,varioAngleDeg(-v),C_BLACK,RADIAL_TK_MINOR);}
 }
-
 void Vario::drawChevron(TFT_eSprite& s) const {
-  const int cx = LCD_W / 2;
-  const int cy = LCD_H / 2;
-  int rDisplay, rOuter, rInner, rCenter;
-  getBandRadii(rDisplay, rOuter, rInner, rCenter);
-
+  const int cx = LCD_W / 2, cy = LCD_H / 2;
+  int rDisplay, rOuter, rInner, rCenter; getBandRadii(rDisplay, rOuter, rInner, rCenter);
   float mid = varioAngleDeg(v_);
-  const float a0 = mid - CHEV_HALF;
-  const float a1 = mid + CHEV_HALF;
+  const float a0 = mid - CHEV_HALF, a1 = mid + CHEV_HALF;
   const int depthPx = (int)roundf(CHEV_DEPTH * BAND_W);
   int half = max(1, CHEV_TK / 2);
-
   for (float a = a0; a <= a1 + 1e-3f; a += CHEV_STEP_DEG) {
-    float frac = 1.0f - fabsf(a - mid) / CHEV_HALF;
-    if (frac < 0) frac = 0;
-    int rEnd = rInner + (int)roundf(frac * depthPx);
-    if (rEnd > rOuter) rEnd = rOuter;
-
-    float rad = a * (float)M_PI / 180.0f;
-    float ux = cosf(rad), uy = sinf(rad);
-
+    float frac = 1.0f - fabsf(a - mid) / CHEV_HALF; if (frac < 0) frac = 0;
+    int rEnd = rInner + (int)roundf(frac * depthPx); if (rEnd > rOuter) rEnd = rOuter;
+    float rad = a * (float)M_PI / 180.0f, ux = cosf(rad), uy = sinf(rad);
     for (int r = rInner; r <= rEnd; ++r) {
-      int x = cx + (int)lroundf(ux * r);
-      int y = cy + (int)lroundf(uy * r);
+      int x = cx + (int)lroundf(ux * r), y = cy + (int)lroundf(uy * r);
       int x0 = x - half, y0 = y - half, w = CHEV_TK, h = CHEV_TK;
-
-      if (x0 < 0) { w += x0; x0 = 0; }
-      if (y0 < 0) { h += y0; y0 = 0; }
-      if (x0 + w > LCD_W)  { w = LCD_W  - x0; }
-      if (y0 + h > LCD_H)  { h = LCD_H  - y0; }
+      if (x0 < 0) { w += x0; x0 = 0; } if (y0 < 0) { h += y0; y0 = 0; }
+      if (x0 + w > LCD_W)  { w = LCD_W  - x0; } if (y0 + h > LCD_H)  { h = LCD_H  - y0; }
       if (w > 0 && h > 0) { s.fillRect(x0, y0, w, h, C_RED); }
     }
   }
 }
-
 void Vario::drawLabels(TFT_eSprite& s) {
-  const int cx = LCD_W / 2;
-  const int cy = LCD_H / 2;
-  int rDisplay, rOuter, rInner, rCenter;
-  getBandRadii(rDisplay, rOuter, rInner, rCenter);
-
-  const int rLab = rInner + BAND_W / 2;
-  const int size = 4;
+  const int cx = LCD_W / 2, cy = LCD_H / 2;
+  int rDisplay, rOuter, rInner, rCenter; getBandRadii(rDisplay, rOuter, rInner, rCenter);
+  const int rLab = rInner + BAND_W/2; const int size = 4;
   char buf[8];
-
-  // 0
-  {
-    float a = varioAngleDeg(0.0f) * (float)M_PI / 180.0f;
-    int x = cx + (int)lroundf(cosf(a) * rLab);
-    int y = cy + (int)lroundf(sinf(a) * rLab);
-    strcpy(buf, "0");
-    drawTextCentered(s, buf, x, y, size, C_BLACK);
-  }
-
-  const int ticks[] = {2, 4, 6, 8};
-  for (int i = 0; i < 4; ++i) {
-    int v = ticks[i];
-    {
-      float a = varioAngleDeg((float)+v) * (float)M_PI / 180.0f;
-      int x = cx + (int)lroundf(cosf(a) * rLab);
-      int y = cy + (int)lroundf(sinf(a) * rLab);
-      snprintf(buf, sizeof(buf), "+%d", v);
-      drawTextCentered(s, buf, x, y, size, C_BLACK);
-    }
-    {
-      float a = varioAngleDeg((float)-v) * (float)M_PI / 180.0f;
-      int x = cx + (int)lroundf(cosf(a) * rLab);
-      int y = cy + (int)lroundf(sinf(a) * rLab);
-      snprintf(buf, sizeof(buf), "-%d", v);
-      drawTextCentered(s, buf, x, y, size, C_BLACK);
-    }
+  float a0 = varioAngleDeg(0.0f) * (float)M_PI / 180.0f;
+  int x = cx + (int)lroundf(cosf(a0) * rLab), y = cy + (int)lroundf(sinf(a0) * rLab);
+  strcpy(buf,"0"); drawTextCentered(s, buf, x, y, size, C_BLACK);
+  const int ticks[] = {2,4,6,8};
+  for (int i=0;i<4;++i){int v=ticks[i];
+    float a = varioAngleDeg((float)+v)*(float)M_PI/180.0f;
+    int x1 = cx + (int)lroundf(cosf(a)*rLab), y1 = cy + (int)lroundf(sinf(a)*rLab);
+    snprintf(buf,sizeof(buf),"+%d",v); drawTextCentered(s, buf, x1, y1, size, C_BLACK);
+    a = varioAngleDeg((float)-v)*(float)M_PI/180.0f;
+    int x2 = cx + (int)lroundf(cosf(a)*rLab), y2 = cy + (int)lroundf(sinf(a)*rLab);
+    snprintf(buf,sizeof(buf),"-%d",v); drawTextCentered(s, buf, x2, y2, size, C_BLACK);
   }
 }
-
 void Vario::drawCenterValue(TFT_eSprite& s) const {
-  const int x = LCD_W / 4;
-  const int y = LCD_H / 2;
-  char buf[16];
-  snprintf(buf, sizeof(buf), "%+.1f", v_);
+  const int x = LCD_W / 4, y = LCD_H / 2;
+  char buf[16]; snprintf(buf, sizeof(buf), "%+.1f", v_);
   uint16_t color = (v_ >= 0.0f) ? C_GREEN : C_RED;
   drawTextCentered(s, buf, x, y, 6, color);
 }
@@ -575,24 +513,21 @@ public:
     const int d1k  = (ft_i / 1000) % 10;
     const int d100 = (ft_i /  100) % 10;
     const int d10  = (ft_i /   10) % 10;
-
     const float unitsValue   = fmod(alt_, 10.0f);
     const float f10          = (unitsValue >= 9.0f) ? (unitsValue - 9.0f) : 0.0f;
     const float tensValue    = fmod(alt_ / 10.0f, 10.0f);
     const float f100         = (tensValue >= 9.0f && unitsValue >= 9.0f) ? (unitsValue - 9.0f) : 0.0f;
     const float hundredsVal  = fmod(alt_ / 100.0f, 10.0f);
     const float f1k          = (hundredsVal >= 9.0f && tensValue >= 9.0f && unitsValue >= 9.0f) ? (unitsValue - 9.0f) : 0.0f;
-
     drawColumn(s, x0, rowY,   bigW,   bigH,   bigSize,   d1k,  f1k);
     drawColumn(s, x1, ySmall, smallW, smallH, smallSize, d100, f100);
     drawColumn(s, x2, ySmall, smallW, smallH, smallSize, d10,  f10);
-
     s.setTextColor(C_LGREY, C_BLACK); s.setTextSize(2); s.setCursor(x2 + smallW + 10, ySmall + smallH - 20); s.print("ft");
   }
 private:
   float alt_ = 0.f;
   static inline void frame(TFT_eSprite& s, int x, int y, int w, int h, int t=4) {
-    if (t < 1) { t = 1; } if (t > w/2) { t = w/2; } if (t > h/2) { t = h/2; }
+    if (t < 1) t = 1; if (t > w/2) t = w/2; if (t > h/2) t = h/2;
     s.fillRect(x,         y,         w, t, C_WHITE);
     s.fillRect(x,         y + h - t, w, t, C_WHITE);
     s.fillRect(x,         y + t,     t, h - 2*t, C_WHITE);
@@ -602,11 +537,11 @@ private:
     const int chH = 8 * textSize; return (topY >= innerY) && (topY + chH <= innerY + innerH);
   }
   static void drawColumn(TFT_eSprite& s, int x, int y, int w, int h, int textSize, int currentDigit, float frac) {
-    const int frameT = 4; const int ix = x + frameT, iy = y + frameT; const int iw = w - 2 * frameT, ih = h - 2 * frameT;
+    const int frameT = 4; const int ix = x + frameT, iy = y + frameT; const int iw = w - 2*frameT, ih = h - 2*frameT;
     s.fillRect(ix, iy, iw, ih, C_BLACK);
     int dCur  = (currentDigit % 10 + 10) % 10; int dPrev = (dCur + 9) % 10; int dNext = (dCur + 1) % 10;
     const int chW = 6 * textSize; const int chH = 8 * textSize; const int xText = ix + (iw - chW) / 2; const int yCenter = iy + (ih - chH) / 2;
-    if (frac < 0) { frac = 0; } if (frac > 1) { frac = 1; } const int roll = (int)lroundf(frac * chH);
+    if (frac < 0) frac = 0; if (frac > 1) frac = 1; const int roll = (int)lroundf(frac * chH);
     const int yPrevTop = yCenter - chH - roll; const int yCurTop  = yCenter - roll; const int yNextTop = yCenter + chH - roll;
     s.setTextWrap(false); s.setTextColor(C_WHITE, C_BLACK); s.setTextSize(textSize);
     if (fullyInside(yPrevTop, textSize, iy, ih)) { s.setCursor(xText, yPrevTop); s.print(dPrev); }
@@ -632,21 +567,21 @@ private:
   float kts_ = 55.0f; int ASI_NUM_X_ = 0; int ASI_KTS_X_ = 0;
 };
 
-// Instances of UI components
+// Instances
 static Vario gVario;
 static Altimeter gAlt;
 static ASI gASI;
 
 // ===================================================================
-// =================== App Screens ===================================
+// =================== Screens =======================================
 // ===================================================================
 
-struct SwipeState { bool active = false; int16_t x0 = 0, y0 = 0; int16_t xLast = 0, yLast = 0; uint32_t t0 = 0; } gSwipe;
+struct SwipeState { bool active=false; int16_t x0=0,y0=0; int16_t xLast=0,yLast=0; uint32_t t0=0; } gSwipe;
 
-static void drawMainScreen(float v, float alt_ft, float asi_kts_now) {
+static void drawMainScreen(float v_ui, float alt_ft, float asi_kts_now) {
   spr.fillSprite(C_BLACK);
-  gVario.update(v);  gVario.draw(spr);
-  gAlt.update(alt_ft); gAlt.draw(spr);
+  gVario.update(v_ui);  gVario.draw(spr);
+  gAlt.update(alt_ft);  gAlt.draw(spr);
   gASI.update(asi_kts_now); gASI.draw(spr);
   uint16_t touchColor = (millis() - g_last_touch_time < 1000) ? C_GREEN : C_RED; spr.fillCircle(LCD_W - 20, 20, 8, touchColor);
   spr.setTextColor(C_LGREY, C_BLACK); spr.setTextSize(1); spr.setCursor(10, LCD_H - 20); spr.print("Swipe L->R for Settings");
@@ -655,7 +590,7 @@ static void drawMainScreen(float v, float alt_ft, float asi_kts_now) {
 
 static void drawSettingsScreen() {
   spr.fillSprite(C_BLACK);
-  spr.setTextColor(C_YELLOW, C_BLACK); spr.setTextSize(4); drawTextCentered(spr, "SETTINGS", LCD_W/2, 30, 4, C_YELLOW);
+  drawTextCentered(spr, "SETTINGS", LCD_W/2, 30, 4, C_YELLOW);
   uint16_t text_color = C_WHITE;
   char volume_text[32]; snprintf(volume_text, sizeof(volume_text), "Audio Volume: %d", settingsManager.settings.audio_volume);
   text_color = (g_settings_screen.selected_setting == 0) ? C_BLUE : C_WHITE; drawTextCentered(spr, volume_text, LCD_W/2, 90, 3, text_color);
@@ -664,244 +599,231 @@ static void drawSettingsScreen() {
   char units_text[32]; snprintf(units_text, sizeof(units_text), "Units: %s", settingsManager.settings.use_metric ? "METRES" : "FEET");
   text_color = (g_settings_screen.selected_setting == 2) ? C_BLUE : C_WHITE; drawTextCentered(spr, units_text, LCD_W/2, 190, 3, text_color);
   text_color = (g_settings_screen.selected_setting == 3) ? C_BLUE : C_WHITE; drawTextCentered(spr, "Calibration", LCD_W/2, 240, 3, text_color);
+
+  // Hints + slider
   if (g_slider.active && (g_settings_screen.selected_setting == 0 || g_settings_screen.selected_setting == 1)) drawSlider();
-  spr.setTextColor(C_LGREY, C_BLACK); spr.setTextSize(2); drawTextCentered(spr, "Swipe R->L to go back", LCD_W/2, LCD_H - 30, 2, C_LGREY);
+  spr.setTextColor(C_LGREY, C_BLACK); spr.setTextSize(2); drawTextCentered(spr, "Tap 'Calibration' or Swipe R->L to go back", LCD_W/2, LCD_H - 30, 2, C_LGREY);
   lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
 }
 
-// ===================================================================
-// ============== Settings Screen Touch (the missing piece) ==========
-// ===================================================================
+// ---- Calibration screen layout ----
+struct Btn { int x,y,w,h; const char* label; };
+static Btn BTN_QNH_M1   {  30,110,120,40,"QNH -1.0"};
+static Btn BTN_QNH_P1   { 316,110,120,40,"QNH +1.0"};
+static Btn BTN_QNH_M01  {  30,160,120,40,"QNH -0.1"};
+static Btn BTN_QNH_P01  { 316,160,120,40,"QNH +0.1"};
+static Btn BTN_QFE_ZERO {  30,210,180,40,"Zero here (QFE)"};
+static Btn BTN_OFFS_RST { 256,210,180,40,"Reset offset"};
+static Btn BTN_FLD_M100 {  30,268,90, 36,"-100"};
+static Btn BTN_FLD_M10  { 130,268,90, 36,"-10"};
+static Btn BTN_FLD_P10  { 230,268,90, 36,"+10"};
+static Btn BTN_FLD_P100 { 330,268,90, 36,"+100"};
+static Btn BTN_FLD_APPL { 150,314,166,36,"Apply Field Elev"};
+static Btn BTN_BACK     { 180,370,106,36,"Back"};
+
+static void drawCalibrationScreen() {
+  spr.fillSprite(C_BLACK);
+  drawTextCentered(spr, "CALIBRATION", LCD_W/2, 30, 4, C_YELLOW);
+
+  // live info
+  char line[64];
+  snprintf(line,sizeof(line),"Pressure: %6.1f hPa", isnan(g_p_hpa)?0.0f:g_p_hpa);
+  drawTextCentered(spr, line, LCD_W/2, 64, 2, C_WHITE);
+  snprintf(line,sizeof(line),"QNH: %6.1f hPa", g_qnh_hpa);
+  drawTextCentered(spr, line, LCD_W/2, 84, 2, C_WHITE);
+
+  // Displayed altitude includes offset
+  float alt_disp_ft = ((isnan(g_alt_m_lp)?0.0f:g_alt_m_lp) + g_alt_offset_m) * 3.28084f;
+  snprintf(line,sizeof(line),"Alt (disp): %5.0f ft   Offset: %+.0f ft", alt_disp_ft, g_alt_offset_m*3.28084f);
+  drawTextCentered(spr, line, LCD_W/2, 104, 2, C_LGREY);
+
+  // Buttons
+  drawButton(spr, BTN_QNH_M1.x, BTN_QNH_M1.y, BTN_QNH_M1.w, BTN_QNH_M1.h, BTN_QNH_M1.label, C_WHITE, C_DGREY);
+  drawButton(spr, BTN_QNH_P1.x, BTN_QNH_P1.y, BTN_QNH_P1.w, BTN_QNH_P1.h, BTN_QNH_P1.label, C_WHITE, C_DGREY);
+  drawButton(spr, BTN_QNH_M01.x, BTN_QNH_M01.y, BTN_QNH_M01.w, BTN_QNH_M01.h, BTN_QNH_M01.label, C_WHITE, C_DGREY);
+  drawButton(spr, BTN_QNH_P01.x, BTN_QNH_P01.y, BTN_QNH_P01.w, BTN_QNH_P01.h, BTN_QNH_P01.label, C_WHITE, C_DGREY);
+
+  drawButton(spr, BTN_QFE_ZERO.x, BTN_QFE_ZERO.y, BTN_QFE_ZERO.w, BTN_QFE_ZERO.h, BTN_QFE_ZERO.label, C_WHITE, C_BLUE);
+  drawButton(spr, BTN_OFFS_RST.x, BTN_OFFS_RST.y, BTN_OFFS_RST.w, BTN_OFFS_RST.h, BTN_OFFS_RST.label, C_WHITE, C_BLUE);
+
+  // Field elevation target line + buttons
+  char fld[64]; snprintf(fld,sizeof(fld),"Field Elev Target: %5.0f ft", g_field_target_ft);
+  drawTextCentered(spr, fld, LCD_W/2, 252, 2, C_WHITE);
+  drawButton(spr, BTN_FLD_M100.x, BTN_FLD_M100.y, BTN_FLD_M100.w, BTN_FLD_M100.h, BTN_FLD_M100.label, C_WHITE, C_DGREY);
+  drawButton(spr, BTN_FLD_M10.x,  BTN_FLD_M10.y,  BTN_FLD_M10.w,  BTN_FLD_M10.h,  BTN_FLD_M10.label,  C_WHITE, C_DGREY);
+  drawButton(spr, BTN_FLD_P10.x,  BTN_FLD_P10.y,  BTN_FLD_P10.w,  BTN_FLD_P10.h,  BTN_FLD_P10.label,  C_WHITE, C_DGREY);
+  drawButton(spr, BTN_FLD_P100.x, BTN_FLD_P100.y, BTN_FLD_P100.w, BTN_FLD_P100.h, BTN_FLD_P100.label, C_WHITE, C_DGREY);
+  drawButton(spr, BTN_FLD_APPL.x, BTN_FLD_APPL.y, BTN_FLD_APPL.w, BTN_FLD_APPL.h, BTN_FLD_APPL.label, C_WHITE, C_BLUE);
+
+  drawButton(spr, BTN_BACK.x, BTN_BACK.y, BTN_BACK.w, BTN_BACK.h, BTN_BACK.label, C_WHITE, C_RED);
+
+  spr.setTextColor(C_LGREY, C_BLACK); spr.setTextSize(1);
+  spr.setCursor(10, LCD_H - 18); spr.print("Swipe R->L to go back");
+  lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
+}
 
 static void handleSettingsTouch(int16_t x, int16_t y) {
-  // If slider active and touch within slider band -> adjust slider
-  if (g_slider.active &&
-      y >= g_slider.y_pos - 10 &&
-      y <= g_slider.y_pos + g_slider.height + 10) {
-    updateSliderFromTouch(x, y);
+  if (g_slider.active && y >= g_slider.y_pos - 10 && y <= g_slider.y_pos + g_slider.height + 10) { updateSliderFromTouch(x, y); return; }
+
+  if      (y >=  75 && y <= 105) { g_settings_screen.selected_setting = 0; setupSlider(); }
+  else if (y >= 125 && y <= 155) { g_settings_screen.selected_setting = 1; setupSlider(); }
+  else if (y >= 175 && y <= 205) { g_settings_screen.selected_setting = 2; settingsManager.setUseMetric(!settingsManager.settings.use_metric); g_slider.active = false; }
+  else if (y >= 225 && y <= 255) { g_settings_screen.selected_setting = 3; g_in_calib = true; g_slider.active = false; }
+}
+
+static inline float pow1903(float x){ return powf(x, 0.1903f); }
+static inline float invPow1903(float x){ return powf(x, 1.0f/0.1903f); }
+
+// Compute QNH from pressure & desired field elevation (m)
+static float qnh_from_field_elev_hpa(float station_p_hpa, float elev_m) {
+  // From h = 44330 * (1 - (p/QNH)^0.1903)  -> QNH = p / (1 - h/44330)^(1/0.1903)
+  float term = 1.0f - (elev_m / 44330.0f);
+  term = constrain(term, 0.1f, 1.2f);
+  return station_p_hpa / invPow1903(term);
+}
+
+static void persist_cal() {
+  cal_prefs.putFloat("qnh", g_qnh_hpa);
+  cal_prefs.putFloat("ofs", g_alt_offset_m);
+}
+
+static void handleCalibrationTouch(int16_t x, int16_t y) {
+  auto qnh_bump = [&](float d){
+    g_qnh_hpa = constrain(g_qnh_hpa + d, 900.0f, 1050.0f);
+    persist_cal();
+    g_baro_mute_until_ms = millis() + 800; // soft gate
+  };
+  if (hit(x,y, BTN_QNH_M1.x, BTN_QNH_M1.y, BTN_QNH_M1.w, BTN_QNH_M1.h)) { qnh_bump(-1.0f); return; }
+  if (hit(x,y, BTN_QNH_P1.x, BTN_QNH_P1.y, BTN_QNH_P1.w, BTN_QNH_P1.h)) { qnh_bump(+1.0f); return; }
+  if (hit(x,y, BTN_QNH_M01.x, BTN_QNH_M01.y, BTN_QNH_M01.w, BTN_QNH_M01.h)) { qnh_bump(-0.1f); return; }
+  if (hit(x,y, BTN_QNH_P01.x, BTN_QNH_P01.y, BTN_QNH_P01.w, BTN_QNH_P01.h)) { qnh_bump(+0.1f); return; }
+
+  if (hit(x,y, BTN_QFE_ZERO.x, BTN_QFE_ZERO.y, BTN_QFE_ZERO.w, BTN_QFE_ZERO.h)) {
+    float z_now = isnan(g_alt_m_lp)?0.0f:g_alt_m_lp;
+    g_alt_offset_m = -z_now; persist_cal(); return;
+  }
+  if (hit(x,y, BTN_OFFS_RST.x, BTN_OFFS_RST.y, BTN_OFFS_RST.w, BTN_OFFS_RST.h)) {
+    g_alt_offset_m = 0.0f; persist_cal(); return;
+  }
+
+  if (hit(x,y, BTN_FLD_M100.x, BTN_FLD_M100.y, BTN_FLD_M100.w, BTN_FLD_M100.h)) { g_field_target_ft -= 100.0f; return; }
+  if (hit(x,y, BTN_FLD_M10.x,  BTN_FLD_M10.y,  BTN_FLD_M10.w,  BTN_FLD_M10.h )) { g_field_target_ft -= 10.0f;  return; }
+  if (hit(x,y, BTN_FLD_P10.x,  BTN_FLD_P10.y,  BTN_FLD_P10.w,  BTN_FLD_P10.h )) { g_field_target_ft += 10.0f;  return; }
+  if (hit(x,y, BTN_FLD_P100.x, BTN_FLD_P100.y, BTN_FLD_P100.w, BTN_FLD_P100.h)) { g_field_target_ft += 100.0f; return; }
+  if (hit(x,y, BTN_FLD_APPL.x, BTN_FLD_APPL.y, BTN_FLD_APPL.w, BTN_FLD_APPL.h)) {
+    float elev_m = g_field_target_ft / 3.28084f;
+    if (!isnan(g_p_hpa)) {
+      g_qnh_hpa = qnh_from_field_elev_hpa(g_p_hpa, elev_m);
+      persist_cal();
+      g_baro_mute_until_ms = millis() + 800;
+    }
     return;
   }
 
-  // Hit zones for each row (match drawSettingsScreen Y positions)
-  if      (y >=  75 && y <= 105) { // Volume row
-    g_settings_screen.selected_setting = 0;
-    setupSlider();
-  }
-  else if (y >= 125 && y <= 155) { // Brightness row
-    g_settings_screen.selected_setting = 1;
-    setupSlider();
-  }
-  else if (y >= 175 && y <= 205) { // Units row
-    g_settings_screen.selected_setting = 2;
-    settingsManager.setUseMetric(!settingsManager.settings.use_metric);
-    g_slider.active = false;
-  }
-  else if (y >= 225 && y <= 255) { // Calibration placeholder
-    g_settings_screen.selected_setting = 3;
-    g_settings_screen.calibrating = true;
-    g_slider.active = false;
-  }
+  if (hit(x,y, BTN_BACK.x, BTN_BACK.y, BTN_BACK.w, BTN_BACK.h)) { g_in_calib = false; return; }
 }
 
 // ===================================================================
-// =================== Kalman Filter (Altitude/Velocity/Bias) ========
+// =================== Kalman Filter =================================
 // ===================================================================
 
 struct BaroKalman {
-  // state: [z, v, b] = [altitude (m), vertical speed (m/s), measurement bias (m)]
-  float z = 0.f, v = 0.f, b = 0.f;
-  float P[3][3] = { {1,0,0},{0,1,0},{0,0,1} };
-
-  // tunables (variances)
-  float qz = 0.01f;   // position process noise (m^2 / s)
-  float qv = 0.15f;   // velocity process noise ((m/s)^2 / s)
-  float qb = 0.0001f; // bias random-walk (m^2 / s)
-  float r  = 0.36f;   // measurement noise (m^2) => 0.6 m RMS
-
-  void init(float z0) {
-    z = z0; v = 0.f; b = 0.f;
-    P[0][0]=10.f; P[0][1]=0;    P[0][2]=0;
-    P[1][0]=0;    P[1][1]=1.f;  P[1][2]=0;
-    P[2][0]=0;    P[2][1]=0;    P[2][2]=1.f;
+  float z=0.f, v=0.f, b=0.f;                  // state [alt, vel, bias]
+  float P[3][3]={{1,0,0},{0,1,0},{0,0,1}};
+  float qz=0.01f, qv=0.15f, qb=0.0001f, r=0.36f;
+  void init(float z0){ z=z0; v=0.f; b=0.f; P[0][0]=10.f;P[0][1]=0;P[0][2]=0; P[1][0]=0;P[1][1]=1.f;P[1][2]=0; P[2][0]=0;P[2][1]=0;P[2][2]=1.f; }
+  void predict(float dt){
+    z += v*dt;
+    float P00=P[0][0],P01=P[0][1],P02=P[0][2], P10=P[1][0],P11=P[1][1],P12=P[1][2], P20=P[2][0],P21=P[2][1],P22=P[2][2];
+    float AP00=P00+dt*P10, AP01=P01+dt*P11, AP02=P02+dt*P12;
+    float AP10=P10, AP11=P11, AP12=P12;
+    float AP20=P20, AP21=P21, AP22=P22;
+    P[0][0]=AP00+dt*AP10; P[0][1]=AP01+dt*AP11; P[0][2]=AP02+dt*AP12;
+    P[1][0]=AP10;         P[1][1]=AP11;         P[1][2]=AP12;
+    P[2][0]=AP20;         P[2][1]=AP21;         P[2][2]=AP22;
+    P[0][0]+=qz*dt; P[1][1]+=qv*dt; P[2][2]+=qb*dt;
+    P[1][0]=P[0][1]; P[2][0]=P[0][2]; P[2][1]=P[1][2];
   }
-
-  void setNoise(float _qz, float _qv, float _qb, float _r) { qz=_qz; qv=_qv; qb=_qb; r=_r; }
-
-  void predict(float dt) {
-    // x = A x, A = [[1,dt,0],[0,1,0],[0,0,1]]
-    z += v * dt;
-
-    // P = A P A^T + Q
-    float P00=P[0][0], P01=P[0][1], P02=P[0][2];
-    float P10=P[1][0], P11=P[1][1], P12=P[1][2];
-    float P20=P[2][0], P21=P[2][1], P22=P[2][2];
-
-    // A P
-    float AP00 = P00 + dt*P10;
-    float AP01 = P01 + dt*P11;
-    float AP02 = P02 + dt*P12;
-
-    float AP10 = P10;
-    float AP11 = P11;
-    float AP12 = P12;
-
-    float AP20 = P20;
-    float AP21 = P21;
-    float AP22 = P22;
-
-    // (A P) A^T
-    P[0][0] = AP00 + dt*AP10;
-    P[0][1] = AP01 + dt*AP11;
-    P[0][2] = AP02 + dt*AP12;
-
-    P[1][0] = AP10;
-    P[1][1] = AP11;
-    P[1][2] = AP12;
-
-    P[2][0] = AP20;
-    P[2][1] = AP21;
-    P[2][2] = AP22;
-
-    // add Q
-    P[0][0] += qz * dt;
-    P[1][1] += qv * dt;
-    P[2][2] += qb * dt;
-
-    // enforce symmetry
-    P[1][0] = P[0][1];
-    P[2][0] = P[0][2];
-    P[2][1] = P[1][2];
-  }
-
-  void update(float z_meas) {
-    // y = z_meas = [1 0 1] * [z v b]^T + noise
+  void update(float z_meas){
     float y = z_meas - (z + b);
-
-    // S = H P H^T + R = Pzz + 2*Pzb + Pbb + r
     float Pzz=P[0][0], Pzb=P[0][2], Pbb=P[2][2];
-    float S = Pzz + 2.f*Pzb + Pbb + r;
-    if (S <= 1e-6f) S = 1e-6f;
-    float invS = 1.0f / S;
-
-    // K = P H^T / S, H^T=[1,0,1]^T
-    float Kz = (P[0][0] + P[0][2]) * invS;
-    float Kv = (P[1][0] + P[1][2]) * invS;
-    float Kb = (P[2][0] + P[2][2]) * invS;
-
-    // state update
-    z += Kz * y;
-    v += Kv * y;
-    b += Kb * y;
-
-    // covariance update
-    float HP0 = P[0][0] + P[2][0];
-    float HP1 = P[0][1] + P[2][1];
-    float HP2 = P[0][2] + P[2][2];
-
-    float P00 = P[0][0] - Kz*HP0; float P01 = P[0][1] - Kz*HP1; float P02 = P[0][2] - Kz*HP2;
-    float P10 = P[1][0] - Kv*HP0; float P11 = P[1][1] - Kv*HP1; float P12 = P[1][2] - Kv*HP2;
-    float P20 = P[2][0] - Kb*HP0; float P21 = P[2][1] - Kb*HP1; float P22 = P[2][2] - Kb*HP2;
-
-    P[0][0]=P00; P[0][1]=P01; P[0][2]=P02;
-    P[1][0]=P10; P[1][1]=P11; P[1][2]=P12;
-    P[2][0]=P20; P[2][1]=P21; P[2][2]=P22;
-
-    // enforce symmetry
-    P[1][0] = P[0][1] = 0.5f*(P[1][0]+P[0][1]);
-    P[2][0] = P[0][2] = 0.5f*(P[2][0]+P[0][2]);
-    P[2][1] = P[1][2] = 0.5f*(P[2][1]+P[1][2]);
+    float S = Pzz + 2.f*Pzb + Pbb + r; if (S<=1e-6f) S=1e-6f; float invS = 1.0f/S;
+    float Kz=(P[0][0]+P[0][2])*invS, Kv=(P[1][0]+P[1][2])*invS, Kb=(P[2][0]+P[2][2])*invS;
+    z+=Kz*y; v+=Kv*y; b+=Kb*y;
+    float HP0=P[0][0]+P[2][0], HP1=P[0][1]+P[2][1], HP2=P[0][2]+P[2][2];
+    float P00=P[0][0]-Kz*HP0, P01=P[0][1]-Kz*HP1, P02=P[0][2]-Kz*HP2;
+    float P10=P[1][0]-Kv*HP0, P11=P[1][1]-Kv*HP1, P12=P[1][2]-Kv*HP2;
+    float P20=P[2][0]-Kb*HP0, P21=P[2][1]-Kb*HP1, P22=P[2][2]-Kb*HP2;
+    P[0][0]=P00; P[0][1]=P01; P[0][2]=P02; P[1][0]=P10; P[1][1]=P11; P[1][2]=P12; P[2][0]=P20; P[2][1]=P21; P[2][2]=P22;
+    P[1][0]=P[0][1]=0.5f*(P[1][0]+P[0][1]); P[2][0]=P[0][2]=0.5f*(P[2][0]+P[0][2]); P[2][1]=P[1][2]=0.5f*(P[2][1]+P[1][2]);
   }
 };
-
-// Global KF instance + deadband + soft-start gate
 static BaroKalman g_kf;
-#ifndef V_DEADBAND
-static const float V_DEADBAND = 0.15f;  // clamp tiny jiggle to zero (m/s)
-#endif
-static uint32_t g_baro_mute_until_ms = 0;
 
-// Altitude helper (hPa in, meters out) – ISA barometric formula
+#ifndef V_DEADBAND
+static const float V_DEADBAND = 0.15f;  // (m/s) – tweak 0.10..0.20
+#endif
+
+// Altitude helper (hPa in, meters out)
 static inline float alt_from_pressure_hpa(float p_hpa, float p0_hpa) {
   return 44330.0f * (1.0f - powf(p_hpa / p0_hpa, 0.1903f));
 }
 
 // ===================================================================
-// =================== BMP388 Helpers ================================
+// =================== BMP388 (BMP3XX) ===============================
 // ===================================================================
 
 static void baro_begin() {
   Serial.printf("[BARO] I2C1 (secondary): SDA=%d, SCL=%d @400kHz\n", BARO_SDA_PIN, BARO_SCL_PIN);
   Wire1.begin(BARO_SDA_PIN, BARO_SCL_PIN, 400000U);
 
-  const uint8_t addrs[] = {0x77, 0x76}; // Adafruit STEMMA QT defaults to 0x77
+  const uint8_t addrs[] = {0x77, 0x76};
   for (uint8_t a : addrs) {
     Serial.printf("[BARO] Probing BMP3XX @ 0x%02X... ", a);
     if (g_bmp.begin_I2C(a, &Wire1)) { Serial.println("FOUND"); g_bmp_ok = true; break; } else { Serial.println("nope"); }
   }
   if (!g_bmp_ok) { Serial.println("[BARO] ✗ No BMP388 detected"); return; }
 
-  // Configure: decent OSR, strong IIR, moderate ODR
   g_bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
   g_bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
   g_bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_15);
   g_bmp.setOutputDataRate(BMP3_ODR_50_HZ);
 
-  // ---- Warm-up & baseline: discard a few, average a dozen ----
-  const int DISCARD = 5, USE = 12;
-  float sum = 0.f; int good = 0;
-  for (int i = 0; i < DISCARD + USE; ++i) {
+  // Warm-up: discard 5, average 12 to seed KF
+  const int DISCARD=5, USE=12; float sum=0.f; int good=0;
+  for (int i=0;i<DISCARD+USE;++i){
     if (!g_bmp.performReading()) { delay(10); continue; }
-    float p_hpa = g_bmp.pressure * 0.01f; // Pa -> hPa
-    float z = alt_from_pressure_hpa(p_hpa, g_qnh_hpa);
+    g_p_hpa = g_bmp.pressure * 0.01f;
+    float z = alt_from_pressure_hpa(g_p_hpa, g_qnh_hpa);
     if (isnan(z)) { delay(10); continue; }
-    if (i >= DISCARD) { sum += z; good++; }
+    if (i>=DISCARD){ sum += z; good++; }
     delay(10);
   }
-  float z0 = (good > 0) ? (sum / good) : 0.f;
-
-  // Init filter + state
+  float z0 = (good>0)? (sum/good) : 0.f;
   g_kf.init(z0);
-  g_alt_m_lp     = z0;
-  g_v_mps        = 0.f;
+  g_alt_m_lp = z0;
+  g_v_mps    = 0.f;
   g_baro_last_ms = millis();
-
-  // Mute vario/needle briefly while the filter firms up
   g_baro_mute_until_ms = millis() + 800;
 
-  Serial.printf("[BARO] ✓ BMP388 ready. Seed altitude: %.1f m (QNH=%.2f hPa)\n", z0, g_qnh_hpa);
+  Serial.printf("[BARO] ✓ Ready. Seed z=%.1f m, QNH=%.1f hPa\n", z0, g_qnh_hpa);
 }
 
 static void baro_update() {
   if (!g_bmp_ok) return;
-
-  uint32_t now = millis();
-  float dt = (now - g_baro_last_ms) * 0.001f;
-  if (dt <= 0.f) dt = 1e-3f;
-  g_baro_last_ms = now;
-
+  uint32_t now = millis(); float dt = (now - g_baro_last_ms) * 0.001f; if (dt<=0.f) dt=1e-3f; g_baro_last_ms = now;
   if (!g_bmp.performReading()) return;
+  g_p_hpa = g_bmp.pressure * 0.01f; // Pa -> hPa
+  float z_meas = alt_from_pressure_hpa(g_p_hpa, g_qnh_hpa); if (isnan(z_meas)) return;
 
-  // Compute altitude from pressure explicitly
-  float p_hpa = g_bmp.pressure * 0.01f;  // Pa -> hPa
-  float z_meas = alt_from_pressure_hpa(p_hpa, g_qnh_hpa);
-  if (isnan(z_meas)) return;
-
-  // Outlier gate: ignore a single impossible step very early
   if (!isnan(g_alt_m_lp)) {
     float dz = fabsf(z_meas - g_alt_m_lp);
-    if (dz > 30.0f && dt < 0.05f) {   // >30 m in <50 ms? ignore update once
-      g_kf.predict(dt);
-      return;
-    }
+    if (dz > 30.0f && dt < 0.05f) { g_kf.predict(dt); return; }
   }
-
-  // Normal predict + update
   g_kf.predict(dt);
   g_kf.update(z_meas);
-
-  // Publish filtered outputs
-  g_alt_m_lp = g_kf.z;   // m
-  g_v_mps    = g_kf.v;   // m/s
+  g_alt_m_lp = g_kf.z;
+  g_v_mps    = g_kf.v;
 }
 
 // ===================================================================
@@ -915,30 +837,33 @@ void setup() {
 
   settingsManager.begin();
 
+  // Load persisted cal
+  cal_prefs.begin("cal", false);
+  g_qnh_hpa      = cal_prefs.getFloat("qnh", 1013.25f);
+  g_alt_offset_m = cal_prefs.getFloat("ofs", 0.0f);
+
   // Display
-  Serial.println("[DISPLAY] Initializing display.");
   CO5300_init(); delay(500); lcd_setRotation(0);
   lcd_brightness(settingsManager.settings.display_brightness);
   spr.setColorDepth(16); spr.createSprite(LCD_W, LCD_H); spr.fillSprite(C_BLACK);
   spr.setTextColor(C_WHITE, C_BLACK); spr.setTextSize(3); spr.setCursor(LCD_W/2 - 80, LCD_H/2 - 20); spr.print("BOOTING.");
   lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
-  delay(1000);
+  delay(800);
 
   gASI.begin();
-  Serial.println("[DISPLAY] Display ready");
 
   // Touch
-  Serial.println("[TOUCH] Starting touch initialization.");
   g_touch_initialized = touch_begin();
-  Serial.println(g_touch_initialized ? "[TOUCH] ✓ Touch initialized" : "[TOUCH] ✗ Touch initialization failed");
 
   // Audio
-  Serial.println("[AUDIO] Initializing audio system.");
-  if (!audioManager.begin(settingsManager.settings.audio_volume)) Serial.println("[AUDIO] ✗ Audio initialization failed");
-  else Serial.println("[AUDIO] ✓ Audio system ready");
+  audioManager.begin(settingsManager.settings.audio_volume);
 
   // Baro
   baro_begin();
+
+  // Init field target as current display altitude
+  float alt_disp_ft = ((isnan(g_alt_m_lp)?0.0f:g_alt_m_lp) + g_alt_offset_m) * 3.28084f;
+  g_field_target_ft = roundf(alt_disp_ft/10.0f)*10.0f;
 
   Serial.println("[SYSTEM] Setup complete!");
 }
@@ -946,89 +871,77 @@ void setup() {
 void loop() {
   static uint32_t t0 = millis();
   static uint32_t last_debug = 0;
-  static int16_t  last_touch_y = 0;
   float t = (millis() - t0) * 0.001f;
 
   // Update baro
   baro_update();
 
-  // --- Signals from sensors ---
-  float v;       // m/s
-  float alt_ft;  // feet
+  // Signals
+  float v;       // m/s (for audio)
+  float alt_ft;  // feet (display includes offset)
   if (g_bmp_ok) {
     v = g_v_mps;
-    alt_ft = (isnan(g_alt_m_lp) ? 0.0f : g_alt_m_lp) * 3.28084f;
+    float z_disp_m = (isnan(g_alt_m_lp)?0.0f:g_alt_m_lp) + g_alt_offset_m;
+    alt_ft = z_disp_m * 3.28084f;
   } else {
-    // Fallback demo if no baro connected
     v = (5.0f * KTS_TO_MPS) * sinf(t * 0.6f);
     alt_ft = 3962.0f + 7.0f * sinf(t * 0.12f) + 0.5f * sinf(t * 0.6f);
   }
 
-  // OPTIONAL: median-of-3 to suppress one-sample spikes
-  static float v_hist[3] = {0,0,0};
-  static int   v_idx = 0;
-  v_hist[v_idx] = v;
-  v_idx = (v_idx + 1) % 3;
-  auto median3f = [](float a,float b,float c){
-    if (a>b) { float t=a; a=b; b=t; }
-    if (b>c) { float t=b; b=c; c=t; }
-    if (a>b) { float t=a; a=b; b=t; }
-    return b;
-  };
+  // Median-of-3 on v (optional)
+  static float v_hist[3] = {0,0,0}; static int v_idx = 0;
+  v_hist[v_idx] = v; v_idx = (v_idx + 1) % 3;
+  auto median3f = [](float a,float b,float c){ if(a>b){float t=a;a=b;b=t;} if(b>c){float t=b;b=c;c=t;} if(a>b){float t=a;a=b;b=t;} return b; };
   float v_med = median3f(v_hist[0], v_hist[1], v_hist[2]);
 
-  // Deadband for both audio AND UI
+  // Deadband (audio truth)
   float v_disp = (fabsf(v_med) < V_DEADBAND) ? 0.0f : v_med;
 
-  // Soft-start: hold at zero until baro settles, clamp to plausible range
+  // Soft-start clamp: first ~2.8s keep sane range
   if (millis() < g_baro_mute_until_ms) v_disp = 0.0f;
-  v_disp = constrain(v_disp, -12.0f, +12.0f);
+  if (millis() < g_baro_mute_until_ms + 2000) v_disp = constrain(v_disp, -2.0f, +2.0f);
 
-  // Audio vario
+  // UI-only smoothing (needle EMA, fast ~0.11s tau @60FPS)
+  g_vario_ui = 0.85f * g_vario_ui + 0.15f * v_disp;
+
+  // Audio vario uses v_disp (not smoothed UI)
   audioManager.setVario(v_disp);
 
-  // Simulated ASI until airspeed sensor lands
-  static float asi_val = 55.f;
-  static uint32_t lastAsi = 0;
-  if (millis() - lastAsi > 100) {
-    lastAsi = millis();
-    int delta10 = random(-8, 9);
-    asi_val += delta10 / 10.0f;
-    asi_val = constrain(asi_val, 45.0f, 65.0f);
-  }
+  // Simulated ASI for now
+  static float asi_val = 55.f; static uint32_t lastAsi = 0;
+  if (millis() - lastAsi > 100) { lastAsi = millis(); int d10 = random(-8,9); asi_val = constrain(asi_val + d10/10.0f, 45.0f, 65.0f); }
 
-  // Touch & swipe
+  // Touch / navigation
   if (g_touch_initialized) {
     int16_t x, y; bool pressed = touch_read_once(x, y); uint32_t now = millis();
     if (pressed && !gSwipe.active) {
-      gSwipe.active = true; gSwipe.x0 = x; gSwipe.y0 = y; gSwipe.xLast = x; gSwipe.yLast = y; gSwipe.t0 = now; last_touch_y = y;
-      if (g_in_settings) {
-        if (g_settings_screen.calibrating) { g_settings_screen.calibrating = false; }
-        else { handleSettingsTouch(x, y); }
-      }
+      gSwipe.active = true; gSwipe.x0 = x; gSwipe.y0 = y; gSwipe.xLast = x; gSwipe.yLast = y; gSwipe.t0 = now;
+      if      (g_in_calib)   { handleCalibrationTouch(x,y); }
+      else if (g_in_settings){ handleSettingsTouch(x,y); }
     } else if (pressed && gSwipe.active) {
       gSwipe.xLast = x; gSwipe.yLast = y;
     } else if (!pressed && gSwipe.active) {
-      int dx = gSwipe.xLast - gSwipe.x0; int dy = gSwipe.yLast - gSwipe.y0; uint32_t dt = now - gSwipe.t0;
-      bool isLeftToRight = (dx > 50) && (abs(dy) < 100) && (dt < 1000);
-      bool isRightToLeft = (dx < -50) && (abs(dy) < 100) && (dt < 1000);
+      int dx = gSwipe.xLast - gSwipe.x0, dy = gSwipe.yLast - gSwipe.y0; uint32_t dt = now - gSwipe.t0;
+      bool L2R = (dx >  50) && (abs(dy) < 100) && (dt < 1000);
+      bool R2L = (dx < -50) && (abs(dy) < 100) && (dt < 1000);
       gSwipe.active = false;
-      if (isLeftToRight && !g_in_settings) { g_in_settings = true;  g_slider.active = false; }
-      else if (isRightToLeft && g_in_settings) { g_in_settings = false; g_slider.active = false; }
+      if (L2R && !g_in_settings && !g_in_calib)      { g_in_settings = true; }
+      else if (R2L && g_in_calib)                    { g_in_calib = false; }
+      else if (R2L && g_in_settings && !g_in_calib)  { g_in_settings = false; }
     }
   }
 
   // Render
-  if (g_in_settings) drawSettingsScreen(); else drawMainScreen(v_disp, alt_ft, asi_val);
+  if      (g_in_calib)   drawCalibrationScreen();
+  else if (g_in_settings)drawSettingsScreen();
+  else                   drawMainScreen(g_vario_ui, alt_ft, asi_val);
 
-  // Debug
+  // Telemetry
   if (millis() - last_debug > 5000) {
     last_debug = millis();
-    Serial.printf("[STATUS] Touch:%s Screen:%s Baro:%s v=%.2f m/s alt=%.1fft\n",
-                  g_touch_initialized ? "OK" : "FAIL",
-                  g_in_settings ? "SETTINGS" : "MAIN",
-                  g_bmp_ok ? "OK" : "-",
-                  v_disp, alt_ft);
+    float alt_disp_ft_dbg = ((isnan(g_alt_m_lp)?0.0f:g_alt_m_lp) + g_alt_offset_m) * 3.28084f;
+    Serial.printf("[STAT] P=%.1fhPa QNH=%.1fhPa z=%.2fm v=%.2fm/s b=%.2fm  alt_disp=%.0fft offs=%.0fft UI=%.2f\n",
+      isnan(g_p_hpa)?0.0f:g_p_hpa, g_qnh_hpa, g_kf.z, g_kf.v, g_kf.b, alt_disp_ft_dbg, g_alt_offset_m*3.28084f, g_vario_ui);
   }
 
   delay(16);
