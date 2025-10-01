@@ -1,4 +1,5 @@
-// main.cpp — Display + Audio (ES8311 + I2S) + Vario beeper + CST92xx touch + BMP280 baro (Kalman + deadband)
+// main.cpp — ESP32-S3 Round Instrument Cluster
+// Display + Audio (ES8311 + I2S) + Vario beeper + CST92xx touch + BMP388 baro (Kalman + warmup + deadband)
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -31,8 +32,8 @@
 #include "driver/i2s.h"
 #include "driver/audio/es8311.h"
 
-// BMP280
-#include <Adafruit_BMP280.h>
+// -------- BMP388 / BMP3XX ----------
+#include <Adafruit_BMP3XX.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -42,12 +43,11 @@
 // =================== Constants and Pin Definitions =================
 // ===================================================================
 
-// Display constants
 static const int LCD_W   = 466;
 static const int LCD_H   = 466;
 static const int COL_OFF = 6;
 
-// Primary I2C for touch/codec control (from pins_config.h if present)
+// Primary I2C (touch/codec control)
 #if defined(IIC_SDA)
 #  define I2C_SDA_PIN IIC_SDA
 #elif !defined(I2C_SDA_PIN)
@@ -72,7 +72,7 @@ static const int COL_OFF = 6;
 #  define TOUCH_INT_PIN -1
 #endif
 
-// Secondary I2C for BMP280 (requested mapping)
+// Secondary I2C for baro
 #ifndef BARO_SDA_PIN
 #  define BARO_SDA_PIN 18
 #endif
@@ -123,15 +123,14 @@ TouchDrvCST92xx g_touch;
 SettingsManager settingsManager;
 AudioManager   audioManager;
 
-// BMP280 on second I2C
-Adafruit_BMP280 g_bmp(&Wire1);
+// ---- BMP388 (BMP3XX) on Wire1 ----
+Adafruit_BMP3XX g_bmp;
 bool            g_bmp_ok = false;
-float           g_qnh_hpa = 1013.25f; // default QNH, tweak later via Settings
+float           g_qnh_hpa = 1013.25f; // default QNH
 
-// Baro-derived state (legacy outputs fed by filter)
-static float    g_alt_m_last = NAN;     // last raw altitude (m)
-static float    g_alt_m_lp   = NAN;     // smoothed altitude (m)
-static float    g_v_mps      = 0.0f;    // smoothed vertical speed (m/s)
+// Baro-derived state
+static float    g_alt_m_lp   = NAN;     // filtered altitude (m)
+static float    g_v_mps      = 0.0f;    // filtered vertical speed (m/s)
 static uint32_t g_baro_last_ms = 0;
 
 // Colors
@@ -142,7 +141,6 @@ static const uint16_t C_GREEN  = 0x07E0;
 static const uint16_t C_LGREY  = 0xC618;
 static const uint16_t C_BLUE   = 0x001F;
 static const uint16_t C_YELLOW = 0xFFE0;
-static const uint16_t C_DARK_BLUE = 0x0010;
 
 // Application state
 bool     g_touch_initialized = false;
@@ -377,7 +375,6 @@ public:
 private:
   float v_ = 0.f;
 
-  // helpers (declared here, defined after the class)
   static void fillDiskVertical(TFT_eSprite& s, int cx, int cy, int r, uint16_t color);
   static void drawBand(TFT_eSprite& s);
   static void drawCaps(TFT_eSprite& s);
@@ -388,7 +385,6 @@ private:
   void        drawCenterValue(TFT_eSprite& s) const;
 };
 
-// -- Vario rendering orchestration
 void Vario::draw(TFT_eSprite& s) {
   drawBand(s);
   drawCaps(s);
@@ -673,12 +669,38 @@ static void drawSettingsScreen() {
   lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
 }
 
+// ===================================================================
+// ============== Settings Screen Touch (the missing piece) ==========
+// ===================================================================
+
 static void handleSettingsTouch(int16_t x, int16_t y) {
-  if (g_slider.active && y >= g_slider.y_pos - 10 && y <= g_slider.y_pos + g_slider.height + 10) { updateSliderFromTouch(x, y); return; }
-  if      (y >=  75 && y <= 105) { g_settings_screen.selected_setting = 0; setupSlider(); }
-  else if (y >= 125 && y <= 155) { g_settings_screen.selected_setting = 1; setupSlider(); }
-  else if (y >= 175 && y <= 205) { g_settings_screen.selected_setting = 2; settingsManager.setUseMetric(!settingsManager.settings.use_metric); g_slider.active = false; }
-  else if (y >= 225 && y <= 255) { g_settings_screen.selected_setting = 3; g_settings_screen.calibrating = true; g_slider.active = false; }
+  // If slider active and touch within slider band -> adjust slider
+  if (g_slider.active &&
+      y >= g_slider.y_pos - 10 &&
+      y <= g_slider.y_pos + g_slider.height + 10) {
+    updateSliderFromTouch(x, y);
+    return;
+  }
+
+  // Hit zones for each row (match drawSettingsScreen Y positions)
+  if      (y >=  75 && y <= 105) { // Volume row
+    g_settings_screen.selected_setting = 0;
+    setupSlider();
+  }
+  else if (y >= 125 && y <= 155) { // Brightness row
+    g_settings_screen.selected_setting = 1;
+    setupSlider();
+  }
+  else if (y >= 175 && y <= 205) { // Units row
+    g_settings_screen.selected_setting = 2;
+    settingsManager.setUseMetric(!settingsManager.settings.use_metric);
+    g_slider.active = false;
+  }
+  else if (y >= 225 && y <= 255) { // Calibration placeholder
+    g_settings_screen.selected_setting = 3;
+    g_settings_screen.calibrating = true;
+    g_slider.active = false;
+  }
 }
 
 // ===================================================================
@@ -791,42 +813,62 @@ struct BaroKalman {
   }
 };
 
-// Global KF instance + deadband for UI/audio
+// Global KF instance + deadband + soft-start gate
 static BaroKalman g_kf;
 #ifndef V_DEADBAND
 static const float V_DEADBAND = 0.15f;  // clamp tiny jiggle to zero (m/s)
 #endif
+static uint32_t g_baro_mute_until_ms = 0;
+
+// Altitude helper (hPa in, meters out) – ISA barometric formula
+static inline float alt_from_pressure_hpa(float p_hpa, float p0_hpa) {
+  return 44330.0f * (1.0f - powf(p_hpa / p0_hpa, 0.1903f));
+}
 
 // ===================================================================
-// =================== BMP280 Helpers ================================
+// =================== BMP388 Helpers ================================
 // ===================================================================
 
 static void baro_begin() {
   Serial.printf("[BARO] I2C1 (secondary): SDA=%d, SCL=%d @400kHz\n", BARO_SDA_PIN, BARO_SCL_PIN);
   Wire1.begin(BARO_SDA_PIN, BARO_SCL_PIN, 400000U);
 
-  const uint8_t addrs[] = {0x76, 0x77};
+  const uint8_t addrs[] = {0x77, 0x76}; // Adafruit STEMMA QT defaults to 0x77
   for (uint8_t a : addrs) {
-    Serial.printf("[BARO] Probing BMP280 @ 0x%02X... ", a);
-    if (g_bmp.begin(a)) { Serial.println("FOUND"); g_bmp_ok = true; break; } else { Serial.println("nope"); }
+    Serial.printf("[BARO] Probing BMP3XX @ 0x%02X... ", a);
+    if (g_bmp.begin_I2C(a, &Wire1)) { Serial.println("FOUND"); g_bmp_ok = true; break; } else { Serial.println("nope"); }
   }
-  if (!g_bmp_ok) { Serial.println("[BARO] ✗ No BMP280 detected"); return; }
+  if (!g_bmp_ok) { Serial.println("[BARO] ✗ No BMP388 detected"); return; }
 
-  // Configure sampling (leave standby at library default)
-  g_bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
-                    Adafruit_BMP280::SAMPLING_X16,  // temp
-                    Adafruit_BMP280::SAMPLING_X2,   // pressure
-                    Adafruit_BMP280::FILTER_X16);   // IIR
+  // Configure: decent OSR, strong IIR, moderate ODR
+  g_bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
+  g_bmp.setPressureOversampling(BMP3_OVERSAMPLING_8X);
+  g_bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_15);
+  g_bmp.setOutputDataRate(BMP3_ODR_50_HZ);
 
-  // Prime the filter with the first altitude
-  float z0 = g_bmp.readAltitude(g_qnh_hpa);
-  if (isnan(z0)) z0 = 0.f;
+  // ---- Warm-up & baseline: discard a few, average a dozen ----
+  const int DISCARD = 5, USE = 12;
+  float sum = 0.f; int good = 0;
+  for (int i = 0; i < DISCARD + USE; ++i) {
+    if (!g_bmp.performReading()) { delay(10); continue; }
+    float p_hpa = g_bmp.pressure * 0.01f; // Pa -> hPa
+    float z = alt_from_pressure_hpa(p_hpa, g_qnh_hpa);
+    if (isnan(z)) { delay(10); continue; }
+    if (i >= DISCARD) { sum += z; good++; }
+    delay(10);
+  }
+  float z0 = (good > 0) ? (sum / good) : 0.f;
+
+  // Init filter + state
   g_kf.init(z0);
   g_alt_m_lp     = z0;
   g_v_mps        = 0.f;
   g_baro_last_ms = millis();
 
-  Serial.println("[BARO] ✓ BMP280 ready + Kalman initialized");
+  // Mute vario/needle briefly while the filter firms up
+  g_baro_mute_until_ms = millis() + 800;
+
+  Serial.printf("[BARO] ✓ BMP388 ready. Seed altitude: %.1f m (QNH=%.2f hPa)\n", z0, g_qnh_hpa);
 }
 
 static void baro_update() {
@@ -837,12 +879,23 @@ static void baro_update() {
   if (dt <= 0.f) dt = 1e-3f;
   g_baro_last_ms = now;
 
-  // Measurement
-  (void)g_bmp.readTemperature(); // keep sensor fresh
-  float z_meas = g_bmp.readAltitude(g_qnh_hpa);
+  if (!g_bmp.performReading()) return;
+
+  // Compute altitude from pressure explicitly
+  float p_hpa = g_bmp.pressure * 0.01f;  // Pa -> hPa
+  float z_meas = alt_from_pressure_hpa(p_hpa, g_qnh_hpa);
   if (isnan(z_meas)) return;
 
-  // Predict + Update
+  // Outlier gate: ignore a single impossible step very early
+  if (!isnan(g_alt_m_lp)) {
+    float dz = fabsf(z_meas - g_alt_m_lp);
+    if (dz > 30.0f && dt < 0.05f) {   // >30 m in <50 ms? ignore update once
+      g_kf.predict(dt);
+      return;
+    }
+  }
+
+  // Normal predict + update
   g_kf.predict(dt);
   g_kf.update(z_meas);
 
@@ -896,7 +949,7 @@ void loop() {
   static int16_t  last_touch_y = 0;
   float t = (millis() - t0) * 0.001f;
 
-  // Update baro (if present)
+  // Update baro
   baro_update();
 
   // --- Signals from sensors ---
@@ -926,6 +979,10 @@ void loop() {
 
   // Deadband for both audio AND UI
   float v_disp = (fabsf(v_med) < V_DEADBAND) ? 0.0f : v_med;
+
+  // Soft-start: hold at zero until baro settles, clamp to plausible range
+  if (millis() < g_baro_mute_until_ms) v_disp = 0.0f;
+  v_disp = constrain(v_disp, -12.0f, +12.0f);
 
   // Audio vario
   audioManager.setVario(v_disp);
@@ -961,7 +1018,7 @@ void loop() {
     }
   }
 
-  // Render (feed v_disp to vario UI)
+  // Render
   if (g_in_settings) drawSettingsScreen(); else drawMainScreen(v_disp, alt_ft, asi_val);
 
   // Debug
