@@ -22,7 +22,7 @@ A compact, ESP32‑S3–based **aviation instrument cluster** for a 466×466 rou
   * ES8311 + I²S output (real‑time climb/descent tones)
 * **Sensing**
 
-  * **BMP280** baro on a **secondary I²C bus** (Wire1)
+  * **BMP388** baro on a **secondary I²C bus** (Wire1)
   * **Kalman filter** (z, v, bias) + **median‑of‑3** spike killer + **deadband** for rock‑steady zero
   * **BMP581** support planned (higher ODR & lower noise)
 * **Performance**
@@ -44,7 +44,7 @@ A compact, ESP32‑S3–based **aviation instrument cluster** for a 466×466 rou
 * **Audio:** ES8311 DAC/codec (I²S + MCLK, PA enable)
 * **Baro:**
 
-  * **Now:** BMP280 (I²C, addr 0x76/0x77)
+  * **Now:** BMP388 (I²C, addr 0x76/0x77)
   * **Soon:** BMP581 (I²C, typical addr 0x47)
 
 ### Pin map (default build)
@@ -106,7 +106,7 @@ Key `platformio.ini` highlights:
 
 * `board = esp32s3_flash_16MB`
 * `board_build.psram = enabled`
-* TFT_eSPI + Adafruit BMP280 lib deps
+* TFT_eSPI + Adafruit BMP3xx lib deps
 * CDC (USB‑Serial) enabled
 
 ---
@@ -139,7 +139,7 @@ Key `platformio.ini` highlights:
 
 ## Wiring notes
 
-* **Baro on Wire1** (SDA=18, SCL=17). BMP280 at 0x76/0x77; future BMP581 typically at 0x47.
+* **Baro on Wire1** (SDA=18, SCL=17). BMP388 at 0x76/0x77; future BMP581 typically at 0x47.
 * Qwiic BMP581 boards include 3.3 V pull‑ups; avoid too many parallel pull‑ups on the same bus.
 * ES8311 requires **MCLK**; ensure the pin supports output on your module.
 
@@ -198,7 +198,7 @@ Choose a license before publishing (MIT/Apache‑2.0 are common). Add the file a
 ## Credits
 
 * **TFT_eSPI** by Bodmer
-* **Adafruit BMP280 Library**, Adafruit Unified Sensor, BusIO
+* **Adafruit BMP388 Library**, Adafruit Unified Sensor, BusIO
 * **SparkFun BMP581** library (planned)
 * **ES8311** codec drivers and examples
 * **CST92xx** touch controller driver
