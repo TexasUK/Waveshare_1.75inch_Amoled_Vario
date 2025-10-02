@@ -191,7 +191,7 @@ PRs welcome—UI polish, sensor backends (BMP581), performance tweaks, docs. Ple
 
 ## License
 
-Choose a license before publishing (MIT/Apache‑2.0 are common). Add the file as `LICENSE` at repo root.
+GNU GENERAL PUBLIC LICENSE Version 3, 29 June 2007
 
 ---
 
