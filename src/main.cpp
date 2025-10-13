@@ -1,4 +1,4 @@
-// ESP32-S3 — C3 Telemetry Consumer + Round Instrument UI + Polar TE Compensation
+// ESP32-S3 — S3 Telemetry Consumer + Round Instrument UI + Polar TE Compensation
 #include <Arduino.h>
 #include <Wire.h>
 #include <math.h>
@@ -18,8 +18,8 @@
 #include "driver/i2s.h"
 #include "driver/audio/es8311.h"
 
-// === Link (updated with TE vario) ===
-#include "link/LinkProtocol.h"
+// === CSV link (replaces LinkProtocol) ===
+#include "CsvSerial.h"
 
 // ===================================================================
 // =================== Constants & Pins ===============================
@@ -29,10 +29,14 @@ static const int LCD_W   = 466;
 static const int LCD_H   = 466;
 static const int COL_OFF = 6;
 
-// S3 header UART pins to C3 link
+// UART1 pins to the sensor (matches your working pair)
 static constexpr uint32_t LINK_BAUD = 115200;
-static constexpr int8_t   S3_RX = 44;
-static constexpr int8_t   S3_TX = 43;
+static constexpr int8_t   S3_RX = 44;     // display RX (from sensor TX=43)
+static constexpr int8_t   S3_TX = 43;     // display TX (to   sensor RX=44)
+
+// Hardware serial port for the link
+HardwareSerial LinkUart(1); // UART1
+CsvSerial      csv(LinkUart, S3_RX, S3_TX, LINK_BAUD);
 
 // I2C for touch/codec control
 #if defined(IIC_SDA)
@@ -66,6 +70,8 @@ static constexpr int8_t   S3_TX = 43;
 #  define TOUCH_MIRROR_Y true
 #endif
 
+static inline bool valid_gpio(int pin) { return pin >= 0 && pin <= 48; }
+
 // ===================================================================
 // =================== Globals & Managers ============================
 // ===================================================================
@@ -77,13 +83,8 @@ SettingsManager settingsManager;
 AudioManager    audioManager;
 Preferences     ui_prefs;
 
-// S3 needs its own LinkProtocol instance
-LinkProtocol    g_link;
-
-// ADD THIS LINE - Swipe state for gesture detection
+// Swipe state for gesture detection
 struct SwipeState { bool active=false; int16_t x0=0,y0=0; int16_t xLast=0,yLast=0; uint32_t t0=0; } gSwipe;
-
-static inline bool valid_gpio(int pin) { return pin >= 0 && pin <= 48; }
 
 // ===================================================================
 // =================== Polar Settings ================================
@@ -91,59 +92,26 @@ static inline bool valid_gpio(int pin) { return pin >= 0 && pin <= 48; }
 
 struct PolarSettings {
     bool teCompEnabled = true;
-    int selectedPolar = 0;
+    int  selectedPolar = 0;
     char polarName[32] = "LS8-b";
     bool settingsChanged = false;
 };
 
 static PolarSettings polarSettings;
-static int settingsPage = 0;  // 0=main, 1=audio, 2=display, 3=polar
+static int settingsPage = 0;  // 0=main, 3=polar
 static int g_selected_setting = 0;
 
 // Available polar names for UI
-const char* polarNames[] = {
-    "LS8-b", "DG-800", "ASG-29", "Discus"
-};
+const char* polarNames[] = { "LS8-b", "DG-800", "ASG-29", "Discus" };
 const int polarNameCount = 4;
 
 // ===================================================================
-// =================== Minimal Link RX (SLIP + CRC) ==================
+// =================== Telemetry Processing ==========================
 // ===================================================================
 
-#ifndef LP_SLIP_FEND
-  #define LP_SLIP_FEND  0xC0
-#endif
-#ifndef LP_SLIP_FESC
-  #define LP_SLIP_FESC  0xDB
-#endif
-#ifndef LP_SLIP_TFEND
-  #define LP_SLIP_TFEND 0xDC
-#endif
-#ifndef LP_SLIP_TFESC
-  #define LP_SLIP_TFESC 0xDD
-#endif
-
-static uint16_t crc16_ccitt(const uint8_t* d, size_t n, uint16_t crc = 0xFFFF) {
-  while (n--) {
-    crc ^= (uint16_t)(*d++) << 8;
-    for (int i = 0; i < 8; ++i)
-      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-  }
-  return crc;
-}
-
-// Public telemetry globals
-TelemetryMsg  gTlm;
-TelemetryMsg  gTlmRaw;
-volatile bool gTlmFresh = false;
-
-// RX state / stats
-static const size_t RX_MAX = 256;
-static uint8_t  rxbuf[RX_MAX];
-static size_t   rxlen = 0;
-static bool     in_frame = false;
-static bool     esc = false;
-static uint32_t framesOk=0, framesCrc=0, framesUnknown=0, bytesRx=0;
+// We'll parse into CsvTlm (from CsvSerial.h)
+static bool     filtersInit=false;
+static uint32_t firstFrameMs=0;
 
 // Vario smoothing
 template<size_t N>
@@ -154,74 +122,30 @@ struct Ring {
     if (!sz) return 0.0f;
     float tmp[N];
     for(size_t i=0;i<sz;++i) tmp[i]=d[i];
-    for(size_t i=1;i<sz;++i){ float v=tmp[i]; size_t j=i; while(j>0 && tmp[j-1]>v){ tmp[j]=tmp[j-1]; --j; } tmp[j]=v; }
+    for(size_t i=1;i<sz;++i){
+      float v=tmp[i]; size_t j=i;
+      while(j>0 && tmp[j-1]>v){ tmp[j]=tmp[j-1]; --j; }
+      tmp[j]=v;
+    }
     return (sz&1) ? tmp[sz/2] : 0.5f*(tmp[sz/2-1]+tmp[sz/2]);
   }
 };
 static Ring<9> varioMed;
-static bool     filtersInit=false;
-static uint32_t firstFrameMs=0;
 static float    varioEma=0.0f, altEma=0.0f;
 
-static void reset_frame(){ in_frame=false; esc=false; rxlen=0; }
-
-static void process_frame(){
-  if (rxlen < 3) return;
-  const uint8_t  type = rxbuf[0];
-  const size_t   plen = rxlen - 1 - 2;
-  const uint16_t got  = (uint16_t)rxbuf[1+plen] | ((uint16_t)rxbuf[1+plen+1] << 8);
-  uint16_t calc = crc16_ccitt(rxbuf, 1+plen);
-  if (calc != got) { framesCrc++; return; }
-
-  if (type == FT_TELEMETRY && plen >= sizeof(TelemetryMsg)) {
-    TelemetryMsg m; memcpy(&m, &rxbuf[1], sizeof(TelemetryMsg));
-    gTlmRaw = m;
-
-    const uint32_t now = millis();
-    if (!filtersInit) { filtersInit=true; firstFrameMs=now; varioEma=0.0f; altEma=m.alt_m; }
-
-    // Startup settling ~2s
-    const bool settling = (now - firstFrameMs) < 2000;
-
-    // Clamp insane vario spikes
-    float vClamp = polarSettings.teCompEnabled ? m.te_vario_mps : m.vario_mps;
-    if (vClamp > 20.0f) vClamp=20.0f; if (vClamp < -20.0f) vClamp=-20.0f;
-    varioMed.push(vClamp);
-    float vMed = varioMed.median();
-    const float aVar = settling ? 0.12f : 0.28f;
-    varioEma = (1-aVar)*varioEma + aVar*vMed;
-
-    // Altitude EMA
-    const float aAlt = 0.12f;
-    altEma = (1-aAlt)*altEma + aAlt*m.alt_m;
-
-    TelemetryMsg f = m;
-    f.vario_mps = settling ? 0.0f : varioEma;
-    f.alt_m     = altEma;
-    if (f.asi_kts < 2.0f) f.track_deg = NAN;
-
-    gTlm = f;
-    gTlmFresh = true;
-    framesOk++;
-  } else {
-    framesUnknown++;
-  }
-}
-
-static void link_poll() {
-  while (Serial1.available()) {
-    uint8_t b=(uint8_t)Serial1.read(); bytesRx++;
-    if (!in_frame) { if (b==LP_SLIP_FEND){ in_frame=true; rxlen=0; esc=false; } continue; }
-    if (b==LP_SLIP_FEND){ if (rxlen>=3) process_frame(); reset_frame(); continue; }
-    if (esc){ if (b==LP_SLIP_TFEND) b=LP_SLIP_FEND; else if (b==LP_SLIP_TFESC) b=LP_SLIP_TFESC; else { reset_frame(); continue; } esc=false; }
-    else if (b==LP_SLIP_FESC){ esc=true; continue; }
-    if (rxlen<RX_MAX) rxbuf[rxlen++]=b; else reset_frame();
-  }
-}
+// Current telemetry values for UI
+static float current_v_ui = 0.0f;
+static float current_alt_ft = 0.0f;
+static float current_asi_kts = 0.0f;
+static int current_gps_sats = 0;
+static int current_flight_mode = 0;
 
 // ===================================================================
 // =================== Touch & UI helpers ============================
 // ===================================================================
+
+static bool g_touch_initialized = false;
+static uint32_t g_last_touch_time = 0;
 
 static bool touch_begin() {
   Serial.println("\n[TOUCH] Starting touch initialization.");
@@ -249,9 +173,6 @@ static bool touch_begin() {
   return false;
 }
 
-static bool g_touch_initialized = false;
-static uint32_t g_last_touch_time = 0;
-
 static bool touch_read_once(int16_t &x, int16_t &y) {
   if (!g_touch_initialized) return false;
   int16_t xs[5], ys[5];
@@ -275,10 +196,46 @@ static const uint16_t C_BLUE   = 0x001F;
 static const uint16_t C_YELLOW = 0xFFE0;
 static const uint16_t C_DGREY  = 0x7BEF;
 static const uint16_t C_CYAN   = 0x07FF;
+static const uint16_t C_ORANGE = 0xFC00;
+static const uint16_t C_PURPLE = 0xF81F;
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+// ===================================================================
+// =================== Flight Mode Helpers ===========================
+// ===================================================================
+
+// Flight mode constants
+enum FlightMode {
+  MODE_CRUISE = 0,
+  MODE_THERMAL = 1,
+  MODE_CLIMB = 2,
+  MODE_DESCENT = 3
+};
+
+// Get flight mode text
+static const char* getFlightModeText(int mode) {
+  switch (mode) {
+    case MODE_CRUISE:  return "CRUISE";
+    case MODE_THERMAL: return "THERMAL";
+    case MODE_CLIMB:   return "CLIMB";
+    case MODE_DESCENT: return "DESCENT";
+    default:           return "UNKNOWN";
+  }
+}
+
+// Get flight mode color
+static uint16_t getFlightModeColor(int mode) {
+  switch (mode) {
+    case MODE_CRUISE:  return C_BLUE;
+    case MODE_THERMAL: return C_ORANGE;
+    case MODE_CLIMB:   return C_GREEN;
+    case MODE_DESCENT: return C_RED;
+    default:           return C_LGREY;
+  }
+}
 
 // UI constants
 static const int   BAND_W    = 50;
@@ -300,8 +257,6 @@ static const int x1 = x0 + bigW  + gap;
 static const int x2 = x1 + smallW + gap;
 
 // ASI
-static const int ASI_MIN = 45;
-static const int ASI_MAX = 65;
 static const int ASI_Y   = ySmall + smallH + 48;
 static const int ASI_X   = rowX;
 static const int ASI_FONT= 6, ASI_KTS_FONT=4;
@@ -310,9 +265,13 @@ static const int ASI_KTS_CHAR_H=8*ASI_KTS_FONT;
 static const int ASI_FIELD_CHARS=3;
 static const int ASI_FIELD_W=ASI_FIELD_CHARS*ASI_CHAR_W;
 static const int ASI_GUTTER=0;
-static const int ASI_LABEL_W=3*(6*ASI_KTS_FONT);
 
-// UI helpers
+static inline void drawTextCentered(TFT_eSprite& s, const char* str, int x, int y, int size, uint16_t fg, uint16_t bg=C_BLACK) {
+  s.setTextWrap(false); s.setTextColor(fg, bg); s.setTextSize(size);
+  int w = (int)strlen(str) * 6 * size; int h = 8 * size;
+  s.setCursor(x - w/2, y - h/2); s.print(str);
+}
+
 static inline void getBandRadii(int &rDisplay, int &rOuter, int &rInner, int &rCenter) {
   rDisplay = min(LCD_W, LCD_H) / 2 - max(0, SHRINK);
   if (rDisplay < 1) rDisplay = 1;
@@ -328,12 +287,6 @@ static inline float varioAngleDeg(float v) {
   float t = powf(fabsf(v) / VARIO_MAX, VARIO_GAM);
   float d = 90.0f * t;
   return 180.0f + s * d;
-}
-
-static inline void drawTextCentered(TFT_eSprite& s, const char* str, int x, int y, int size, uint16_t fg, uint16_t bg=C_BLACK) {
-  s.setTextWrap(false); s.setTextColor(fg, bg); s.setTextSize(size);
-  int w = (int)strlen(str) * 6 * size; int h = 8 * size;
-  s.setCursor(x - w/2, y - h/2); s.print(str);
 }
 
 class Vario {
@@ -530,14 +483,14 @@ static void drawRoundedRect(TFT_eSprite& s, int x, int y, int w, int h, int r, u
 }
 
 static void drawTextCentered2(TFT_eSprite& s, const char* label, int x, int y, int size, uint16_t col){
-  s.setTextColor(col, C_BLACK); s.setTextSize(size); 
-  int w = strlen(label)*6*size, h=8*size; 
+  s.setTextColor(col, C_BLACK); s.setTextSize(size);
+  int w = strlen(label)*6*size, h=8*size;
   s.setCursor(x-w/2, y-h/2); s.print(label);
 }
 
 static void drawButton(TFT_eSprite& s, int x, int y, int w, int h, const char* label, uint16_t fg, uint16_t bg) {
-  s.fillRect(x, y, w, h, bg); 
-  s.drawRect(x, y, w, h, C_WHITE); 
+  s.fillRect(x, y, w, h, bg);
+  s.drawRect(x, y, w, h, C_WHITE);
   drawTextCentered2(s, label, x + w/2, y + h/2, 2, fg);
 }
 
@@ -570,42 +523,71 @@ static void setupSlider(int which) {
 
 static bool g_in_settings = false;
 
-void drawPolarSettingsScreen() {
+// NEW: Draw main settings screen
+static void drawMainSettingsScreen() {
   spr.fillSprite(C_BLACK);
-  drawTextCentered2(spr, "POLAR SETTINGS", LCD_W/2, 30, 4, C_YELLOW);
+  drawTextCentered2(spr, "SETTINGS", LCD_W/2, 30, 4, C_YELLOW);
   
-  // TE Compensation toggle
-  drawTextCentered2(spr, "TE Compensation:", LCD_W/2 - 80, 80, 2, C_WHITE);
-  drawButton(spr, LCD_W/2 + 40, 70, 60, 30, 
-             polarSettings.teCompEnabled ? "ON" : "OFF",
-             polarSettings.teCompEnabled ? C_GREEN : C_RED, C_BLACK);
+  // Draw settings options with selection highlighting
+  drawTextCentered2(spr, "Volume", LCD_W/2, 100, 3, 
+                   g_selected_setting == 0 ? C_YELLOW : C_WHITE);
+  drawTextCentered2(spr, "Brightness", LCD_W/2, 150, 3, 
+                   g_selected_setting == 1 ? C_YELLOW : C_WHITE);
+  drawTextCentered2(spr, "Polar Settings", LCD_W/2, 200, 3, 
+                   g_selected_setting == 2 ? C_YELLOW : C_WHITE);
+  drawTextCentered2(spr, "Toggle TE Comp", LCD_W/2, 250, 3, 
+                   g_selected_setting == 3 ? C_YELLOW : C_WHITE);
   
-  // Current polar display
-  char polarBuf[64];
-  snprintf(polarBuf, sizeof(polarBuf), "Current: %s", polarSettings.polarName);
-  drawTextCentered2(spr, polarBuf, LCD_W/2, 120, 2, C_CYAN);
+  // Show current TE status
+  drawTextCentered2(spr, polarSettings.teCompEnabled ? "ON" : "OFF", 
+                   LCD_W/2, 280, 3, 
+                   polarSettings.teCompEnabled ? C_GREEN : C_RED);
   
-  // Polar selection buttons
-  drawButton(spr, 50, 160, 120, 40, "LS8-b", C_WHITE, C_DGREY);
-  drawButton(spr, 200, 160, 120, 40, "DG-800", C_WHITE, C_DGREY);
-  drawButton(spr, 50, 210, 120, 40, "ASG-29", C_WHITE, C_DGREY);
-  drawButton(spr, 200, 210, 120, 40, "Discus", C_WHITE, C_DGREY);
-  
-  // Larger, more prominent back button
-  drawButton(spr, LCD_W/2 - 80, 270, 160, 50, "<< BACK", C_YELLOW, C_RED);
+  // Draw slider if active
+  if (g_slider.active) {
+    drawSlider();
+  }
   
   drawTextCentered2(spr, "Swipe LEFT to go back", LCD_W/2, LCD_H - 30, 2, C_LGREY);
   lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
 }
 
-void handlePolarTouch(int16_t x, int16_t y) {
+static void drawPolarSettingsScreen() {
+  spr.fillSprite(C_BLACK);
+  drawTextCentered2(spr, "POLAR SETTINGS", LCD_W/2, 30, 4, C_YELLOW);
+
+  // TE Compensation toggle
+  drawTextCentered2(spr, "TE Compensation:", LCD_W/2, 80, 2, C_WHITE);
+  drawButton(spr, LCD_W/2 - 30, 100, 60, 30,
+             polarSettings.teCompEnabled ? "ON" : "OFF",
+             polarSettings.teCompEnabled ? C_GREEN : C_RED, C_BLACK);
+
+  // Current polar display
+  char polarBuf[64];
+  snprintf(polarBuf, sizeof(polarBuf), "Current: %s", polarSettings.polarName);
+  drawTextCentered2(spr, polarBuf, LCD_W/2, 120, 2, C_CYAN);
+
+  // Polar selection buttons
+  drawButton(spr, 50, 160, 120, 40, "LS8-b", C_WHITE, C_DGREY);
+  drawButton(spr, 200, 160, 120, 40, "DG-800", C_WHITE, C_DGREY);
+  drawButton(spr, 50, 210, 120, 40, "ASG-29", C_WHITE, C_DGREY);
+  drawButton(spr, 200, 210, 120, 40, "Discus", C_WHITE, C_DGREY);
+
+  // Back button
+  drawButton(spr, LCD_W/2 - 80, 270, 160, 50, "<< BACK", C_YELLOW, C_RED);
+
+  drawTextCentered2(spr, "Swipe LEFT to go back", LCD_W/2, LCD_H - 30, 2, C_LGREY);
+  lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
+}
+
+static void handlePolarTouch(int16_t x, int16_t y) {
   // TE Compensation toggle
   if (y >= 70 && y <= 100 && x >= (LCD_W/2 + 40) && x <= (LCD_W/2 + 100)) {
     polarSettings.teCompEnabled = !polarSettings.teCompEnabled;
     polarSettings.settingsChanged = true;
     return;
   }
-  
+
   // Polar selection buttons
   if (y >= 160 && y <= 200) {
     if (x >= 50 && x <= 170) {
@@ -634,104 +616,48 @@ void handlePolarTouch(int16_t x, int16_t y) {
   }
 }
 
-void sendPolarSettingsToC3() {
-    if (!polarSettings.settingsChanged) return;
-    
-    // Send polar selection to C3
-    g_link.sendPolarSelect(polarSettings.selectedPolar);
-    
-    // Send TE toggle to C3  
-    g_link.sendTEToggle(polarSettings.teCompEnabled);
-    
-    Serial.printf("[S3] Sent to C3: Polar=%s (index %d), TE=%s\n",
-                  polarSettings.polarName, polarSettings.selectedPolar,
-                  polarSettings.teCompEnabled ? "ON" : "OFF");
-    
-    polarSettings.settingsChanged = false;
+static void sendPolarSettingsToSensor() {
+  if (!polarSettings.settingsChanged) return;
+
+  csv.sendSetPolar((uint8_t)polarSettings.selectedPolar);
+  csv.sendSetTE(polarSettings.teCompEnabled);
+
+  Serial.printf("[S3] Sent to SENSOR: Polar=%s (index %d), TE=%s\n",
+                polarSettings.polarName, polarSettings.selectedPolar,
+                polarSettings.teCompEnabled ? "ON" : "OFF");
+
+  polarSettings.settingsChanged = false;
 }
 
-void applySettingsChanges() {
-    // Apply slider changes
-    if (g_slider.active) {
-        if (g_selected_setting == 0) { // Volume
-            settingsManager.settings.audio_volume = g_slider.value;
-            audioManager.setVolume(g_slider.value);
-            settingsManager.save();
-            Serial.printf("[SETTINGS] Volume set to: %d\n", g_slider.value);
-        } else if (g_selected_setting == 1) { // Brightness
-            settingsManager.settings.display_brightness = map(g_slider.value, 0, 10, 0, 255);
-            lcd_brightness(settingsManager.settings.display_brightness);
-            settingsManager.save();
-            Serial.printf("[SETTINGS] Brightness set to: %d\n", settingsManager.settings.display_brightness);
-        }
+static void applySettingsChanges() {
+  // Apply slider changes
+  if (g_slider.active) {
+    if (g_selected_setting == 0) { // Volume
+      settingsManager.settings.audio_volume = g_slider.value;
+      audioManager.setVolume(g_slider.value);
+      settingsManager.save();
+      Serial.printf("[SETTINGS] Volume set to: %d\n", g_slider.value);
+      csv.sendSetVol((uint8_t)g_slider.value);
+    } else if (g_selected_setting == 1) { // Brightness
+      settingsManager.settings.display_brightness = (uint8_t)map((long)g_slider.value, 0L, 10L, 0L, 255L);
+      lcd_brightness(settingsManager.settings.display_brightness);
+      settingsManager.save();
+      Serial.printf("[SETTINGS] Brightness set to: %d\n", settingsManager.settings.display_brightness);
+      csv.sendSetBri((uint8_t)g_slider.value); // 0..10 scale
     }
-    
-    // Send any pending polar settings
-    sendPolarSettingsToC3();
-}
-
-void handleTapGesture() {
-    if (g_in_settings) {
-        if (settingsPage == 0) { // Main settings
-            // Determine which item was tapped
-            if (gSwipe.yLast >= 80 && gSwipe.yLast <= 120) {
-                g_selected_setting = 0;
-                setupSlider(0); // Volume slider
-            } else if (gSwipe.yLast >= 130 && gSwipe.yLast <= 170) {
-                g_selected_setting = 1;
-                setupSlider(1); // Brightness slider
-            } else if (gSwipe.yLast >= 180 && gSwipe.yLast <= 220) {
-                g_selected_setting = 2;
-                settingsPage = 3; // Go directly to polar settings
-                Serial.println("[TOUCH] Going to polar settings");
-            } else if (gSwipe.yLast >= 230 && gSwipe.yLast <= 270) {
-                g_selected_setting = 3;
-                polarSettings.teCompEnabled = !polarSettings.teCompEnabled;
-                polarSettings.settingsChanged = true;
-                Serial.printf("[TOUCH] TE toggled: %s\n", polarSettings.teCompEnabled ? "ON" : "OFF");
-            }
-        }
-    }
-}
-
-void drawSettingsScreen() {
-  switch(settingsPage) {
-    case 0: // Main settings
-      spr.fillSprite(C_BLACK);
-      drawTextCentered2(spr, "SETTINGS", LCD_W/2, 30, 4, C_YELLOW);
-
-      char volume_text[32];  snprintf(volume_text,  sizeof(volume_text),  "Audio Volume: %d", settingsManager.settings.audio_volume);
-      char bright_text[32];  snprintf(bright_text,  sizeof(bright_text),  "Brightness: %d", (int)map(settingsManager.settings.display_brightness,0,255,0,10));
-      char polar_text[32];   snprintf(polar_text,   sizeof(polar_text),   "Polar: %s", polarSettings.polarName);
-      char te_text[32];      snprintf(te_text,      sizeof(te_text),      "TE: %s", polarSettings.teCompEnabled ? "ON" : "OFF");
-
-      drawTextCentered2(spr, volume_text, LCD_W/2,  90, 3, (g_selected_setting==0)?C_BLUE:C_WHITE);
-      drawTextCentered2(spr, bright_text, LCD_W/2, 140, 3, (g_selected_setting==1)?C_BLUE:C_WHITE);
-      drawTextCentered2(spr, polar_text,  LCD_W/2, 190, 3, (g_selected_setting==2)?C_BLUE:C_WHITE);
-      drawTextCentered2(spr, te_text,     LCD_W/2, 240, 3, (g_selected_setting==3)?C_BLUE:C_WHITE);
-
-      // Draw slider if active
-      if (g_slider.active) drawSlider();
-
-      spr.setTextColor(C_LGREY, C_BLACK); spr.setTextSize(2);
-      drawTextCentered2(spr, "Swipe LEFT to go back", LCD_W/2, LCD_H - 30, 2, C_LGREY);
-      break;
-      
-    case 3: // Polar settings
-      drawPolarSettingsScreen();
-      break;
   }
-  
-  lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
+
+  // Send any pending polar settings
+  sendPolarSettingsToSensor();
 }
 
 // ===================================================================
 // =================== Main Display ==================================
 // ===================================================================
 
-static inline void drawMainScreen(float v_ui, float alt_ft, float asi_kts_now) {
+static inline void drawMainScreen() {
   spr.fillSprite(C_BLACK);
-  
+
   // Polar/TE status indicator
   spr.setTextColor(polarSettings.teCompEnabled ? C_GREEN : C_LGREY, C_BLACK);
   spr.setTextSize(1);
@@ -741,34 +667,101 @@ static inline void drawMainScreen(float v_ui, float alt_ft, float asi_kts_now) {
   } else {
     spr.print("NETTO");
   }
-  
-  gVario.update(v_ui);  gVario.draw(spr);
-  gAlt.update(alt_ft);  gAlt.draw(spr);
-  gASI.update(asi_kts_now); gASI.draw(spr);
-  
+
+  // NEW: GPS status above altimeter
+  spr.setTextSize(2);
+  if (current_gps_sats < 3) {
+    spr.setTextColor(C_RED, C_BLACK);
+  } else {
+    spr.setTextColor(C_GREEN, C_BLACK);
+  }
+  spr.setCursor(rowX + 20, rowY - 30);
+  spr.print("GPS");
+
+  // NEW: Flight mode display - prominent position at top center
+  const char* modeText = getFlightModeText(current_flight_mode);
+  uint16_t modeColor = getFlightModeColor(current_flight_mode);
+  spr.setTextColor(modeColor, C_BLACK);
+  spr.setTextSize(3);
+  int modeTextWidth = strlen(modeText) * 6 * 3;
+  spr.setCursor((LCD_W - modeTextWidth) / 2, 70);
+  spr.print(modeText);
+
+  // Mode-specific indicators
+  spr.setTextSize(1);
+  spr.setTextColor(C_LGREY, C_BLACK);
+  switch (current_flight_mode) {
+    case MODE_THERMAL:
+      spr.setCursor(10, 100);
+      spr.print("Thermal Entry/Exit");
+      break;
+    case MODE_CLIMB:
+      spr.setCursor(10, 100);
+      spr.print("Climbing");
+      break;
+    case MODE_DESCENT:
+      spr.setCursor(10, 100);
+      spr.print("Descending");
+      break;
+    case MODE_CRUISE:
+      spr.setCursor(10, 100);
+      spr.print("Cruising");
+      break;
+  }
+
+  gVario.update(current_v_ui);  gVario.draw(spr);
+  gAlt.update(current_alt_ft);  gAlt.draw(spr);
+  gASI.update(current_asi_kts); gASI.draw(spr);
+
   uint16_t touchColor = (millis() - g_last_touch_time < 1000) ? C_GREEN : C_RED;
   spr.fillCircle(LCD_W - 20, 20, 8, touchColor);
-  
+
   spr.setTextColor(C_LGREY, C_BLACK); spr.setTextSize(1);
   spr.setCursor(10, LCD_H - 20); spr.print("Swipe RIGHT for Settings");
-  
+
   lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
+}
+
+// NEW: Unified screen drawing function
+static void drawCurrentScreen() {
+  if (g_in_settings) {
+    if (settingsPage == 0) {
+      drawMainSettingsScreen();
+    } else if (settingsPage == 3) {
+      drawPolarSettingsScreen();
+    }
+  } else {
+    drawMainScreen();
+  }
 }
 
 // ===================================================================
 // =================== App lifecycle =================================
 // ===================================================================
 
-//struct SwipeState { bool active=false; int16_t x0=0,y0=0; int16_t xLast=0,yLast=0; uint32_t t0=0; } gSwipe;
+static void handleTapGesture() {
+  if (g_in_settings && settingsPage == 0) {
+    if (gSwipe.yLast >= 80 && gSwipe.yLast <= 120) {
+      g_selected_setting = 0; setupSlider(0);
+    } else if (gSwipe.yLast >= 130 && gSwipe.yLast <= 170) {
+      g_selected_setting = 1; setupSlider(1);
+    } else if (gSwipe.yLast >= 180 && gSwipe.yLast <= 220) {
+      g_selected_setting = 2; settingsPage = 3; Serial.println("[TOUCH] Going to polar settings");
+    } else if (gSwipe.yLast >= 230 && gSwipe.yLast <= 270) {
+      g_selected_setting = 3; polarSettings.teCompEnabled = !polarSettings.teCompEnabled; polarSettings.settingsChanged = true;
+      Serial.printf("[TOUCH] TE toggled: %s\n", polarSettings.teCompEnabled ? "ON" : "OFF");
+    }
+  }
+}
 
 void setup() {
   Serial.begin(115200);
   delay(300);
-  
-  // DISABLE TOUCH LIBRARY DEBUG MESSAGES
+
+  // Reduce library chatter
   esp_log_level_set("*", ESP_LOG_WARN);
-  
-  Serial.println("\n[S3] Boot with Polar TE Support");
+
+  Serial.println("\n[S3] Boot (CSV link, no LinkProtocol)");
 
   settingsManager.begin();
 
@@ -797,152 +790,203 @@ void setup() {
   // Audio
   audioManager.begin(settingsManager.settings.audio_volume);
 
-  // Link - Initialize g_link with UART
-  g_link.begin(LINK_BAUD, S3_RX, S3_TX);
-  Serial.printf("[S3] Link listening on UART (RX=%d, TX=%d) @%u\n", S3_RX, S3_TX, LINK_BAUD);
-  Serial.printf("[S3] Polar: %s, TE: %s\n", polarSettings.polarName, polarSettings.teCompEnabled ? "ON" : "OFF");
+  // CSV link on UART1 (RX=44, TX=43)
+  csv.begin();
+  while (LinkUart.available()) (void)LinkUart.read(); // purge
+  Serial.printf("[S3] Link (CSV) UART1: RX=%d, TX=%d @%u\n", S3_RX, S3_TX, LINK_BAUD);
+
+  // Handshake + settings sync
+  csv.onPong = [](){ Serial.println("[DISPLAY] got PONG ✔"); };
+  csv.onHelloSensor = [](){ Serial.println("[DISPLAY] HELLO from sensor"); };
+  csv.onAck = [](const char* key, long v){ Serial.printf("[DISPLAY] ACK %s=%ld\n", key, v); };
+
+  csv.sendPing(); delay(20);
+  csv.sendSetTE(polarSettings.teCompEnabled);
+  csv.sendSetPolar((uint8_t)polarSettings.selectedPolar);
+  csv.sendSetVol((uint8_t)settingsManager.settings.audio_volume);
+  csv.sendSetBri((uint8_t)map((long)settingsManager.settings.display_brightness, 0L, 255L, 0L, 10L));
+
+  Serial.printf("[S3] Polar: %s, TE: %s, Volume: %d, Brightness(0-10): %ld\n",
+                polarSettings.polarName, polarSettings.teCompEnabled ? "ON" : "OFF",
+                settingsManager.settings.audio_volume,
+                map((long)settingsManager.settings.display_brightness, 0L, 255L, 0L, 10L));
 
   Serial.println("[S3] Ready.");
 }
 
 void loop() {
   static uint32_t last_debug = 0;
+  static uint32_t telemetryCount = 0;
+  static bool needsRedraw = true;
 
-  // Poll link and decode frames
-  link_poll();
+  // Service the CSV link
+  csv.poll();
 
-  // Pull current signals
-  static float v_ui = 0.0f;
-  static float asi_kts_now = 0.0f;
-  static float alt_ft = 0.0f;
+  // Throttled raw RX visibility (sanity)
+  static uint32_t lastRaw = 0;
+  if (millis() - lastRaw > 1000) {
+    lastRaw = millis();
+    Serial.printf("[LINK/RX] available=%d\n", LinkUart.available());
+  }
 
-  static uint32_t last_update_ms = 0;
-  uint32_t now = millis();
-  float dt = (now - last_update_ms) * 0.001f; if (dt <= 0) dt = 1e-3f; last_update_ms = now;
+  // Pull current telemetry from CSV
+  CsvTlm m;
+  bool got = csv.getLatest(m);
+  if (got) {
+    telemetryCount++;
 
-  // If we have fresh telemetry, use it
-  if (gTlmFresh) {
-    gTlmFresh = false;
+    uint32_t now = millis();
 
-    float v_raw = polarSettings.teCompEnabled ? gTlm.te_vario_mps : gTlm.vario_mps;
-    
+    // First-frame init
+    if (!filtersInit) {
+      filtersInit = true;
+      firstFrameMs = now;
+      varioEma = 0.0f;
+      altEma = m.alt_m;
+      Serial.println("[S3] Filters initialized");
+    }
+
+    // Startup settling ~2s
+    const bool settling = (now - firstFrameMs) < 2000;
+
+    // Choose vario stream based on TE toggle
+    float vClamp = polarSettings.teCompEnabled ? m.te : m.netto;
+
+    // Clamp insane spikes
+    if (vClamp > 20.0f) vClamp = 20.0f;
+    if (vClamp < -20.0f) vClamp = -20.0f;
+
+    varioMed.push(vClamp);
+    float vMed = varioMed.median();
+    const float aVar = settling ? 0.12f : 0.28f;
+    varioEma = (1 - aVar) * varioEma + aVar * vMed;
+
+    // Altitude EMA
+    const float aAlt = 0.12f;
+    altEma = (1 - aAlt) * altEma + aAlt * m.alt_m;
+
     // deadband for audio/needle stability
     const float V_DEADBAND = 0.15f;
-    float v_disp = (fabsf(v_raw) < V_DEADBAND) ? 0.0f : v_raw;
+    float v_disp = (fabsf(varioEma) < V_DEADBAND) ? 0.0f : varioEma;
 
     // UI-only smoothing
-    v_ui = 0.85f * v_ui + 0.15f * v_disp;
+    current_v_ui = 0.85f * current_v_ui + 0.15f * v_disp;
 
     // Altitude (m -> ft)
-    alt_ft = gTlm.alt_m * 3.28084f;
+    current_alt_ft = altEma * 3.28084f;
 
-    // ASI
-    const bool hasFix = (gTlm.fix >= 1);
-    asi_kts_now = hasFix ? (gTlm.asi_kts < 0.0f ? 0.0f : gTlm.asi_kts) : 0.0f;
+    // ASI (only when we have a GPS fix)
+    const bool hasFix = (m.fix >= 1);
+    current_asi_kts = hasFix ? (m.asi_kts < 0.0f ? 0.0f : m.asi_kts) : 0.0f;
+
+    // GPS satellites
+    current_gps_sats = m.sats;
+
+    // Flight mode (from CsvTlm struct)
+    current_flight_mode = m.mode;
 
     // Audio uses the de-deadbanded vario
     audioManager.setVario(v_disp);
-  } else {
-    // No fresh frame
-    v_ui *= 0.999f;
+
+    // Mark that we need to redraw
+    needsRedraw = true;
+  }
+
+  // Draw the current screen if needed
+  if (needsRedraw) {
+    drawCurrentScreen();
+    needsRedraw = false;
   }
 
   // Touch / navigation
+  uint32_t now = millis();
   if (g_touch_initialized) {
-    int16_t x, y; 
-    bool pressed = touch_read_once(x, y); 
-    uint32_t t0 = now;
-    
+    int16_t x, y;
+    bool pressed = touch_read_once(x, y);
+
     if (pressed && !gSwipe.active) {
-        // Touch started
-        gSwipe.active = true; 
-        gSwipe.x0 = x; 
-        gSwipe.y0 = y; 
-        gSwipe.xLast = x; 
-        gSwipe.yLast = y; 
-        gSwipe.t0 = t0;
-    } 
+      gSwipe.active = true;
+      gSwipe.x0 = x; gSwipe.y0 = y;
+      gSwipe.xLast = x; gSwipe.yLast = y;
+      gSwipe.t0 = now;
+    }
     else if (pressed && gSwipe.active) {
-        // Just update the last position for swipe detection
-        gSwipe.xLast = x; 
-        gSwipe.yLast = y;
-        
-        // If slider is active, update it in real-time
-        if (g_in_settings && settingsPage == 0 && g_slider.active) {
-            if (y >= g_slider.y_pos && y <= g_slider.y_pos + g_slider.height) {
-                updateSliderFromTouch(x);
-            }
+      gSwipe.xLast = x; gSwipe.yLast = y;
+
+      // Slider
+      if (g_in_settings && settingsPage == 0 && g_slider.active) {
+        if (y >= g_slider.y_pos && y <= g_slider.y_pos + g_slider.height) {
+          updateSliderFromTouch(x);
+          needsRedraw = true;
         }
-        
-        // Handle polar settings touches in real-time
-        if (g_in_settings && settingsPage == 3) {
-            handlePolarTouch(x, y);
-        }
+      }
+      // Polar page
+      if (g_in_settings && settingsPage == 3) {
+        handlePolarTouch(x, y);
+        needsRedraw = true;
+      }
     }
     else if (!pressed && gSwipe.active) {
-        // Touch ended - detect simple gestures
-        int dx = gSwipe.xLast - gSwipe.x0;
-        int dy = gSwipe.yLast - gSwipe.y0; 
-        uint32_t dtg = now - gSwipe.t0;
-        
-        // Much simpler and more reliable gesture detection
-        bool isSwipe = (abs(dx) > 50) && (abs(dy) < 40) && (dtg < 1000);
-        bool isLeftSwipe = isSwipe && (dx < 0);
-        bool isRightSwipe = isSwipe && (dx > 0);
-        bool isTap = (abs(dx) < 20 && abs(dy) < 20 && dtg < 400);
-        
-        Serial.printf("[TOUCH] End: dx=%d, Lswipe=%d, Rswipe=%d, tap=%d\n", 
-                     dx, isLeftSwipe, isRightSwipe, isTap);
-        
-        gSwipe.active = false;
-        
-        if (isRightSwipe && !g_in_settings) {
-            // Swipe right to enter settings (more natural)
-            g_in_settings = true;
-            settingsPage = 0;
-            g_slider.active = false;
-            Serial.println("[TOUCH] Entering settings");
+      int dx = gSwipe.xLast - gSwipe.x0;
+      int dy = gSwipe.yLast - gSwipe.y0;
+      uint32_t dtg = now - gSwipe.t0;
+
+      bool isSwipe = (abs(dx) > 50) && (abs(dy) < 40) && (dtg < 1000);
+      bool isLeftSwipe = isSwipe && (dx < 0);
+      bool isRightSwipe = isSwipe && (dx > 0);
+      bool isTap = (abs(dx) < 20 && abs(dy) < 20 && dtg < 400);
+
+      Serial.printf("[TOUCH] End: dx=%d, Lswipe=%d, Rswipe=%d, tap=%d\n",
+                    dx, isLeftSwipe, isRightSwipe, isTap);
+
+      gSwipe.active = false;
+
+      if (isRightSwipe && !g_in_settings) {
+        g_in_settings = true;
+        settingsPage = 0;
+        g_slider.active = false;
+        needsRedraw = true;
+        Serial.println("[TOUCH] Entering settings");
+      }
+      else if (isLeftSwipe && g_in_settings) {
+        applySettingsChanges();
+        g_in_settings = false;
+        g_slider.active = false;
+        needsRedraw = true;
+        Serial.println("[TOUCH] Exiting settings");
+      }
+      else if (isTap) {
+        if (g_in_settings) {
+          handleTapGesture();
+          needsRedraw = true;
         }
-        else if (isLeftSwipe && g_in_settings) {
-            // Swipe left to exit settings (more natural) - works from any settings screen
-            applySettingsChanges();
-            g_in_settings = false;
-            g_slider.active = false;
-            Serial.println("[TOUCH] Exiting settings");
-        }
-        else if (isTap) {
-            // Handle taps
-            handleTapGesture();
-        }
+      }
     }
   }
 
   // Send polar settings periodically if changed
   static uint32_t lastPolarSend = 0;
   if (polarSettings.settingsChanged && (now - lastPolarSend > 1000)) {
-    sendPolarSettingsToC3();
+    sendPolarSettingsToSensor();
     lastPolarSend = now;
-    
+
     // Save to preferences
     ui_prefs.begin("s3ui", false);
     ui_prefs.putBool("teEnabled", polarSettings.teCompEnabled);
-    ui_prefs.putUInt("polarIdx", polarSettings.selectedPolar);
+    ui_prefs.putUInt("polarIdx", (uint32_t)polarSettings.selectedPolar);
     ui_prefs.end();
-  }
 
-  // Render
-  if (g_in_settings) {
-    drawSettingsScreen();
-  } else {
-    drawMainScreen(v_ui, alt_ft, asi_kts_now);
+    Serial.printf("[S3-POLAR] Sent to SENSOR: %s, TE=%s\n",
+                  polarSettings.polarName, polarSettings.teCompEnabled ? "ON" : "OFF");
   }
 
   // Debug heartbeat
-  if (now - last_debug > 2000) {
+  if (now - last_debug > 5000) {
     last_debug = now;
-    const char* teStatus = polarSettings.teCompEnabled ? "TE" : "NETTO";
-    Serial.printf("[S3] %s=%.2f alt=%.0fft asi=%.1fkt polar=%s\n",
-                  teStatus, v_ui, alt_ft, asi_kts_now, polarSettings.polarName);
+    Serial.printf("[S3-STATUS] TE=%s polar=%s frames=%lu mode=%d(%s)\n",
+                  polarSettings.teCompEnabled ? "ON" : "OFF",
+                  polarSettings.polarName, (unsigned long)telemetryCount,
+                  current_flight_mode, getFlightModeText(current_flight_mode));
   }
 
   delay(16);

@@ -1,199 +1,96 @@
 #include "LinkProtocol.h"
 
-void LinkProtocol::begin(uint32_t baud, int8_t rxPin, int8_t txPin) {
-  ser_ = &Serial1; // Use UART1 for link communication
-  ser_->begin(baud, SERIAL_8N1, rxPin, txPin);
-}
-
-// ==================== SENDING METHODS ====================
-
 void LinkProtocol::sendTelemetry(const TelemetryMsg& m) {
-  sendFrame(FT_TELEMETRY, (const uint8_t*)&m, sizeof(TelemetryMsg));
+  sendFrame(FT_TELEMETRY, reinterpret_cast<const uint8_t*>(&m), sizeof(TelemetryMsg));
 }
-
-void LinkProtocol::sendTouch(uint16_t type, uint16_t x, uint16_t y) {
-  TouchMsg msg = {type, x, y};
-  sendFrame(FT_TOUCH, (const uint8_t*)&msg, sizeof(TouchMsg));
-}
-
 void LinkProtocol::sendSettingChange(uint8_t id, int32_t value) {
-  SettingChangeMsg msg = {id, value};
-  sendFrame(FT_SETTING_CHANGE, (const uint8_t*)&msg, sizeof(SettingChangeMsg));
+  SettingChangeMsg msg { id, value };
+  sendFrame(FT_SETTING_CHANGE, reinterpret_cast<const uint8_t*>(&msg), sizeof(msg));
 }
-
-void LinkProtocol::sendFrame(uint8_t type, const uint8_t* payload, size_t len) {
-  if (!ser_) return;
-  
-  // Calculate CRC (include type in CRC calculation)
-  uint16_t crc = crc16(&type, 1);
-  crc = crc16(payload, len, crc);
-  
-  // SLIP encode and send frame
-  ser_->write(FEND);
-  
-  // Send type
-  slipPush(type);
-  
-  // Send payload
-  for (size_t i = 0; i < len; i++) {
-    slipPush(payload[i]);
-  }
-  
-  // Send CRC (little-endian)
-  slipPush(crc & 0xFF);
-  slipPush((crc >> 8) & 0xFF);
-  
-  ser_->write(FEND);
+void LinkProtocol::sendTouch(const TouchMsg& t) {
+  sendFrame(FT_TOUCH, reinterpret_cast<const uint8_t*>(&t), sizeof(t));
 }
-
-void LinkProtocol::slipPush(uint8_t c) {
-  if (c == FEND) {
-    ser_->write(FESC);
-    ser_->write(TFEND);
-  } else if (c == FESC) {
-    ser_->write(FESC);
-    ser_->write(TFESC);
-  } else {
-    ser_->write(c);
-  }
-}
-
-// ==================== RECEIVING METHODS ====================
 
 bool LinkProtocol::pollTelemetry(TelemetryMsg& out) {
-  uint8_t type;
-  const uint8_t* payload;
-  size_t plen;
-  
-  if (pollFrame(type, payload, plen)) {
-    if (type == FT_TELEMETRY && plen == sizeof(TelemetryMsg)) {
-      memcpy(&out, payload, sizeof(TelemetryMsg));
-      return true;
-    }
-  }
-  return false;
+  uint8_t type = 0; uint8_t buf[sizeof(TelemetryMsg)]; size_t len = sizeof(buf);
+  if (!readFrame(type, buf, len, sizeof(buf))) return false;
+  if (type != FT_TELEMETRY || len != sizeof(TelemetryMsg)) return false;
+  memcpy(&out, buf, sizeof(TelemetryMsg));
+  return true;
 }
-
 bool LinkProtocol::pollTouch(TouchMsg& out) {
-  uint8_t type;
-  const uint8_t* payload;
-  size_t plen;
-  
-  if (pollFrame(type, payload, plen)) {
-    if (type == FT_TOUCH && plen == sizeof(TouchMsg)) {
-      memcpy(&out, payload, sizeof(TouchMsg));
-      return true;
-    }
-  }
-  return false;
+  uint8_t type = 0; uint8_t buf[sizeof(TouchMsg)]; size_t len = sizeof(buf);
+  if (!readFrame(type, buf, len, sizeof(buf))) return false;
+  if (type != FT_TOUCH || len != sizeof(TouchMsg)) return false;
+  memcpy(&out, buf, sizeof(TouchMsg));
+  return true;
 }
-
 bool LinkProtocol::pollSettingChange(SettingChangeMsg& out) {
-  uint8_t type;
-  const uint8_t* payload;
-  size_t plen;
-  
-  if (pollFrame(type, payload, plen)) {
-    if (type == FT_SETTING_CHANGE && plen == sizeof(SettingChangeMsg)) {
-      memcpy(&out, payload, sizeof(SettingChangeMsg));
-      return true;
-    }
-  }
-  return false;
-}
-
-// ==================== SLIP RECEIVE LOGIC ====================
-
-bool LinkProtocol::pollFrame(uint8_t& type, const uint8_t*& pay, size_t& plen) {
-  static bool esc = false;
-  
-  while (ser_ && ser_->available()) {
-    uint8_t b = ser_->read();
-    
-    if (!in_frame_) {
-      if (b == FEND) {
-        in_frame_ = true;
-        rxlen_ = 0;
-        esc = false;
-      }
-      continue;
-    }
-    
-    if (esc) {
-      if (b == TFEND) b = FEND;
-      else if (b == TFESC) b = FESC;
-      else {
-        // Invalid escape sequence
-        in_frame_ = false;
-        rxlen_ = 0;
-        esc = false;
-        continue;
-      }
-      esc = false;
-    } else if (b == FESC) {
-      esc = true;
-      continue;
-    } else if (b == FEND) {
-      // End of frame
-      if (rxlen_ >= 3) { // Need at least type + 2 byte CRC
-        // Parse the frame
-        uint8_t* p = rxbuf_;
-        size_t n = rxlen_;
-        if (tryParse(p, n, type, pay, plen)) {
-          in_frame_ = false;
-          rxlen_ = 0;
-          return true;
-        }
-      }
-      in_frame_ = false;
-      rxlen_ = 0;
-      esc = false;
-      continue;
-    }
-    
-    // Add to buffer if space
-    if (rxlen_ < RX_MAX) {
-      rxbuf_[rxlen_++] = b;
-    } else {
-      // Buffer overflow
-      in_frame_ = false;
-      rxlen_ = 0;
-      esc = false;
-    }
-  }
-  return false;
-}
-
-bool LinkProtocol::tryParse(uint8_t*& p, size_t& n, uint8_t& type, const uint8_t*& pay, size_t& plen) {
-  if (n < 3) return false; // Need type + 2 byte CRC
-  
-  // Extract type (first byte)
-  type = p[0];
-  
-  // Calculate payload length (everything except type and 2-byte CRC)
-  plen = n - 3;
-  pay = &p[1];
-  
-  // Verify CRC
-  uint16_t calc_crc = crc16(&type, 1);
-  calc_crc = crc16(pay, plen, calc_crc);
-  uint16_t recv_crc = (uint16_t)p[1+plen] | ((uint16_t)p[1+plen+1] << 8);
-  
-  if (calc_crc != recv_crc) {
-    return false;
-  }
-  
+  uint8_t type = 0; uint8_t buf[sizeof(SettingChangeMsg)]; size_t len = sizeof(buf);
+  if (!readFrame(type, buf, len, sizeof(buf))) return false;
+  if (type != FT_SETTING_CHANGE || len != sizeof(SettingChangeMsg)) return false;
+  memcpy(&out, buf, sizeof(SettingChangeMsg));
   return true;
 }
 
-// ==================== CRC16 IMPLEMENTATION ====================
+void LinkProtocol::sendFrame(uint8_t type, const uint8_t* data, size_t len) {
+  if (!ser_) return;
+  uint8_t hdr[5] = { 0xC3, 0x33, type, (uint8_t)(len & 0xFF), (uint8_t)((len >> 8) & 0xFF) };
+
+  uint16_t crc = crc16(&type, 1);
+  uint8_t llo = hdr[3], lhi = hdr[4];
+  crc = crc16(&llo, 1, crc);
+  crc = crc16(&lhi, 1, crc);
+  crc = crc16(data, len, crc);
+
+  ser_->write(hdr, sizeof(hdr));
+  ser_->write(data, len);
+  uint8_t cbuf[2] = { (uint8_t)(crc & 0xFF), (uint8_t)((crc >> 8) & 0xFF) };
+  ser_->write(cbuf, 2);
+}
+
+bool LinkProtocol::readFrame(uint8_t& type, uint8_t* buf, size_t& len, size_t buflen) {
+  if (!ser_) return false;
+
+  while (ser_->available() >= 2) {
+    int b = ser_->peek();
+    if (b == 0xC3) break;
+    ser_->read();
+  }
+  if (ser_->available() < 5) return false;
+
+  uint8_t hdr[5]; ser_->readBytes(hdr, 5);
+  if (!(hdr[0] == 0xC3 && hdr[1] == 0x33)) return false;
+
+  type = hdr[2];
+  uint16_t need = (uint16_t)hdr[3] | ((uint16_t)hdr[4] << 8);
+
+  if (need > buflen) {
+    if (ser_->available() < (int)(need + 2)) return false;
+    for (uint16_t i=0;i<need+2;i++) (void)ser_->read();
+    return false;
+  }
+  if (ser_->available() < (int)(need + 2)) return false;
+
+  ser_->readBytes(buf, need);
+  uint8_t cbuf[2]; ser_->readBytes(cbuf, 2);
+  uint16_t rxcrc = (uint16_t)cbuf[0] | ((uint16_t)cbuf[1] << 8);
+
+  uint16_t crc = crc16(&type, 1);
+  uint8_t llo = hdr[3], lhi = hdr[4];
+  crc = crc16(&llo, 1, crc);
+  crc = crc16(&lhi, 1, crc);
+  crc = crc16(buf, need, crc);
+
+  if (crc != rxcrc) return false;
+  len = need;
+  return true;
+}
 
 uint16_t LinkProtocol::crc16(const uint8_t* d, size_t n, uint16_t crc) {
   while (n--) {
     crc ^= (uint16_t)(*d++) << 8;
-    for (int i = 0; i < 8; ++i) {
-      crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-    }
+    for (int i=0;i<8;i++) crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
   }
   return crc;
 }

@@ -1,95 +1,77 @@
 #pragma once
 #include <Arduino.h>
-#include <HardwareSerial.h>
+#include <Stream.h>
+
+/*
+  Frame:
+  [0xC3][0x33][TYPE][LEN_L][LEN_H][PAYLOAD...][CRC16_L][CRC16_H]
+  CRC16-CCITT(0x1021), init 0xFFFF, over TYPE, LEN_L, LEN_H, PAYLOAD
+*/
 
 enum : uint8_t {
-  FT_TELEMETRY        = 0x01,   // C3 -> S3
-  FT_SETTINGS_SYNC    = 0x02,   // C3 -> S3 (optional)
-  FT_PING             = 0x03,
-  FT_PONG             = 0x04,
-  FT_TOUCH            = 0x81,   // S3 -> C3
-  FT_SETTING_CHANGE   = 0x82,   // S3 -> C3
-  FT_UI_EVENT         = 0x83
+  FT_TELEMETRY        = 0x01,   // Sensor -> Display
+  FT_SETTINGS_SYNC    = 0x02,   // Sensor -> Display (optional)
+  FT_TOUCH            = 0x81,   // Display -> Sensor
+  FT_SETTING_CHANGE   = 0x82    // Display -> Sensor
 };
 
-// NEW: Setting IDs for polar TE compensation
-enum : uint8_t { 
-  SET_VOLUME=0, 
-  SET_BRIGHTNESS=1, 
-  SET_UNITS=2,
-  C3_SET_QNH_PA = 10,      // NEW: QNH setting
-  C3_SET_POLAR = 11,       // NEW: Polar selection
-  C3_TE_TOGGLE = 12        // NEW: TE compensation toggle
+enum : uint8_t {
+  C3_SET_QNH_PA      = 10,
+  C3_SET_POLAR       = 11,
+  C3_TE_TOGGLE       = 12,
+  C3_SET_VOLUME      = 13,  // 0..10
+  C3_SET_BRIGHTNESS  = 14   // 0..10
 };
 
-// UPDATED: Telemetry message with TE vario field
+#pragma pack(push, 1)
 struct TelemetryMsg {
-  float   vario_mps;       // Netto vario
-  float   te_vario_mps;    // NEW: TE-compensated vario
+  float   vario_mps;
+  float   te_vario_mps;
   float   alt_m;
   float   asi_kts;
   float   track_deg;
-  uint8_t fix;             // 0=none, 1=2D, 2=3D
+  uint8_t fix;
   uint8_t sats;
-  uint8_t rsv[2];          // Changed: padding adjusted for new field
+  uint8_t rsv[6];
 };
 
-enum : uint16_t { TOUCH_DOWN=0, TOUCH_MOVE=1, TOUCH_UP=2 };
 struct TouchMsg {
   uint16_t type;
   uint16_t x;
   uint16_t y;
 };
 
-// UPDATED: SettingChangeMsg to support polar settings
 struct SettingChangeMsg {
   uint8_t  id;
-  int32_t  value;          // Can store polar index, TE toggle, etc.
+  int32_t  value;
 };
+#pragma pack(pop)
 
 class LinkProtocol {
 public:
-  // UART: pins set in begin()
-  void begin(uint32_t baud, int8_t rxPin, int8_t txPin);
+  LinkProtocol() : ser_(nullptr) {}
+  void attach(Stream* s) { ser_ = s; }
 
-  // ---- C3 -> S3
+  // Outbound
   void sendTelemetry(const TelemetryMsg& m);
-  bool pollTelemetry(TelemetryMsg& out);
-
-  // ---- S3 -> C3  
-  void sendTouch(uint16_t type, uint16_t x, uint16_t y);
   void sendSettingChange(uint8_t id, int32_t value);
+  void sendTouch(const TouchMsg& t);
 
-  // Generic inbound polls
-  bool pollTouch(TouchMsg& out);
-  bool pollSettingChange(SettingChangeMsg& out);
+  inline void sendQNH(uint32_t pa)           { sendSettingChange(C3_SET_QNH_PA, (int32_t)pa); }
+  inline void sendPolarSelect(uint8_t idx)   { sendSettingChange(C3_SET_POLAR,  (int32_t)idx); }
+  inline void sendTEToggle(bool en)          { sendSettingChange(C3_TE_TOGGLE,  en ? 1 : 0);  }
+  inline void sendVolume(uint8_t v)          { sendSettingChange(C3_SET_VOLUME, v); }
+  inline void sendBrightness(uint8_t v)      { sendSettingChange(C3_SET_BRIGHTNESS, v); }
 
-  // NEW: Convenience methods for polar settings
-  void sendPolarSelect(uint8_t polarIndex) {
-    sendSettingChange(C3_SET_POLAR, polarIndex);
-  }
-  
-  void sendTEToggle(bool enabled) {
-    sendSettingChange(C3_TE_TOGGLE, enabled ? 1 : 0);
-  }
-  
-  void sendQNH(uint32_t qnhPa) {
-    sendSettingChange(C3_SET_QNH_PA, qnhPa);
-  }
+  // Inbound
+  bool pollTelemetry(TelemetryMsg& out);        // Display uses this
+  bool pollTouch(TouchMsg& out);                // Sensor uses this
+  bool pollSettingChange(SettingChangeMsg& out);// Sensor uses this
 
 private:
-  HardwareSerial* ser_ = nullptr;
+  void sendFrame(uint8_t type, const uint8_t* data, size_t len);
+  bool readFrame(uint8_t& type, uint8_t* buf, size_t& len, size_t buflen);
+  static uint16_t crc16(const uint8_t* d, size_t n, uint16_t crc = 0xFFFF);
 
-  // SLIP
-  static constexpr uint8_t FEND=0xC0, FESC=0xDB, TFEND=0xDC, TFESC=0xDD;
-  static constexpr size_t RX_MAX = 256;
-  uint8_t rxbuf_[RX_MAX]; size_t rxlen_ = 0; bool in_frame_ = false;
-
-  // utils
-  static uint16_t crc16(const uint8_t* d, size_t n, uint16_t crc=0xFFFF);
-  void slipPush(uint8_t c);
-  void sendFrame(uint8_t type, const uint8_t* payload, size_t len);
-  bool tryParse(uint8_t*& p, size_t& n, uint8_t& type, const uint8_t*& pay, size_t& plen);
-
-  bool pollFrame(uint8_t& type, const uint8_t*& pay, size_t& plen);
+  Stream* ser_;
 };

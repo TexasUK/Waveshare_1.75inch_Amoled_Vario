@@ -161,11 +161,11 @@ uint8_t TouchDrvCST92xx::getPoint(int16_t *x_array, int16_t *y_array, uint8_t ge
         parseFingerData(data, &point_info[i]);
         x_array[i] = point_info[i].x;
         y_array[i] = point_info[i].y;
-        log_d("Finger %d: x %d, y %d, id %d, event 0x%x.", i, point_info[i].x, point_info[i].y, point_info[i].finger_id, point_info[i].evt);
+    //    log_d("Finger %d: x %d, y %d, id %d, event 0x%x.", i, point_info[i].x, point_info[i].y, point_info[i].finger_id, point_info[i].evt);
     }
 
     if (point_info[0].evt == 0x00) {
-        log_d("Release finger ....");
+    //    log_d("Release finger ....");
         return 0;
     }
 
