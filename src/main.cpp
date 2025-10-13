@@ -513,6 +513,17 @@ static void updateSliderFromTouch(int16_t x) {
   float ratio = (float)(x - g_slider.x_pos) / (float)g_slider.width;
   ratio = constrain(ratio, 0.0f, 1.0f);
   g_slider.value = g_slider.min_value + (int)(ratio * (g_slider.max_value - g_slider.min_value));
+  
+  // Apply changes immediately
+  if (g_selected_setting == 0) { // Volume
+    settingsManager.settings.audio_volume = g_slider.value;
+    audioManager.setVolume(g_slider.value);
+    csv.sendSetVol((uint8_t)g_slider.value);
+  } else if (g_selected_setting == 1) { // Brightness
+    settingsManager.settings.display_brightness = (uint8_t)map((long)g_slider.value, 0L, 10L, 0L, 255L);
+    lcd_brightness(settingsManager.settings.display_brightness);
+    csv.sendSetBri((uint8_t)g_slider.value);
+  }
 }
 
 static void setupSlider(int which) {
@@ -585,6 +596,8 @@ static void handlePolarTouch(int16_t x, int16_t y) {
   if (y >= 70 && y <= 100 && x >= (LCD_W/2 + 40) && x <= (LCD_W/2 + 100)) {
     polarSettings.teCompEnabled = !polarSettings.teCompEnabled;
     polarSettings.settingsChanged = true;
+    // Apply immediately
+    csv.sendSetTE(polarSettings.teCompEnabled);
     return;
   }
 
@@ -749,6 +762,8 @@ static void handleTapGesture() {
       g_selected_setting = 2; settingsPage = 3; Serial.println("[TOUCH] Going to polar settings");
     } else if (gSwipe.yLast >= 230 && gSwipe.yLast <= 270) {
       g_selected_setting = 3; polarSettings.teCompEnabled = !polarSettings.teCompEnabled; polarSettings.settingsChanged = true;
+      // Apply immediately
+      csv.sendSetTE(polarSettings.teCompEnabled);
       Serial.printf("[TOUCH] TE toggled: %s\n", polarSettings.teCompEnabled ? "ON" : "OFF");
     }
   }
@@ -949,7 +964,8 @@ void loop() {
         Serial.println("[TOUCH] Entering settings");
       }
       else if (isLeftSwipe && g_in_settings) {
-        applySettingsChanges();
+        // Save settings to preferences (changes already applied immediately)
+        settingsManager.save();
         g_in_settings = false;
         g_slider.active = false;
         needsRedraw = true;
