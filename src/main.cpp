@@ -87,6 +87,44 @@ Preferences     ui_prefs;
 struct SwipeState { bool active=false; int16_t x0=0,y0=0; int16_t xLast=0,yLast=0; uint32_t t0=0; } gSwipe;
 
 // ===================================================================
+// =================== Startup Sequence ===============================
+// ===================================================================
+
+enum StartupState {
+    STARTUP_CONNECTING = 0,      // Wait for sensor connection
+    STARTUP_LOADING_POLARS = 1,  // Load polar data with progress
+    STARTUP_QNH_ENTRY = 2,       // User enters QNH
+    STARTUP_POLAR_SELECTION = 3, // User selects polar
+    STARTUP_COMPLETE = 4         // Ready for operation
+};
+
+struct StartupSettings {
+    StartupState currentState = STARTUP_CONNECTING;
+    uint32_t qnhPa = 101325;  // Default 1013.25 hPa
+    int selectedPolar = 0;
+    bool startupComplete = false;
+};
+
+struct PolarLoadingState {
+    bool sensorConnected = false;
+    bool polarListReceived = false;
+    int expectedPolars = 0;
+    int receivedPolars = 0;
+    float progress = 0.0f;  // 0.0 to 1.0
+    uint32_t connectionStartTime = 0;
+    uint32_t loadingStartTime = 0;
+    int connectionAttempts = 0;
+    int maxConnectionAttempts = 3;
+    uint32_t connectionTimeout = 10000;  // 10 seconds
+    uint32_t loadingTimeout = 30000;     // 30 seconds
+};
+
+static StartupSettings startupSettings;
+static PolarLoadingState g_polarLoading;
+uint32_t g_lastPolarReceived = 0; // Global variable for tracking last polar received
+
+
+// ===================================================================
 // =================== Polar Settings ================================
 // ===================================================================
 
@@ -101,9 +139,447 @@ static PolarSettings polarSettings;
 static int settingsPage = 0;  // 0=main, 3=polar
 static int g_selected_setting = 0;
 
-// Available polar names for UI
-const char* polarNames[] = { "LS8-b", "DG-800", "ASG-29", "Discus" };
-const int polarNameCount = 4;
+// ===================================================================
+// =================== Dynamic Polar Data =============================
+// ===================================================================
+
+struct PolarData {
+  char name[32];
+  float speeds[10];    // Speeds in m/s
+  float sinks[10];     // Sink rates in m/s
+  int pointCount;      // Number of data points
+  bool valid;
+};
+
+struct PolarList {
+  PolarData polars[100];  // Up to 100 polars
+  int count;
+  bool received;
+};
+
+static PolarList g_polarList;
+
+// Fallback polar names (used until sensor sends list)
+const char* fallbackPolarNames[] = { "LS8-b", "DG-800", "ASG-29", "Discus", "LS4", "ASW-27", "Nimbus-4", "Ventus-2" };
+const int fallbackPolarCount = 8;
+
+// Helper functions for polar list management
+static const char* getPolarName(int index) {
+  if (g_polarList.received && index < g_polarList.count) {
+    return g_polarList.polars[index].name;
+  } else if (index < fallbackPolarCount) {
+    return fallbackPolarNames[index];
+  }
+  return "Unknown";
+}
+
+static int getPolarCount() {
+  int count = g_polarList.received ? g_polarList.count : fallbackPolarCount;
+  if (g_polarList.received) {
+    Serial.printf("[POLARS] Using dynamic list: %d polars\n", count);
+  } else {
+    Serial.printf("[POLARS] Using fallback list: %d polars\n", count);
+  }
+  return count;
+}
+
+static bool isPolarValid(int index) {
+  if (g_polarList.received && index < g_polarList.count) {
+    return g_polarList.polars[index].valid;
+  }
+  return index < fallbackPolarCount;
+}
+
+// Parse polar list from CSV command
+static void parsePolarList(const char* line) {
+  // Expected format: "POLARS,name1,name2,name3,..."
+  if (strncmp(line, "POLARS,", 7) != 0) {
+    Serial.printf("[POLARS] Not a POLARS command: %s\n", line);
+    return;
+  }
+  
+  Serial.printf("[POLARS] Received polar list: %s\n", line);
+  
+  const char* data = line + 7; // Skip "POLARS,"
+  
+  // If this is the first POLARS command, reset the list
+  static bool firstPolarList = true;
+  if (firstPolarList) {
+    g_polarList.count = 0;
+    firstPolarList = false;
+  }
+  
+  // Parse comma-separated polar names
+  char* token;
+  char* dataCopy = strdup(data);
+  token = strtok(dataCopy, ",");
+  
+  while (token != NULL && g_polarList.count < 100) {
+    // Trim whitespace
+    while (*token == ' ') token++;
+    char* end = token + strlen(token) - 1;
+    while (end > token && *end == ' ') end--;
+    *(end + 1) = '\0';
+    
+    // Copy name to polar data
+    strncpy(g_polarList.polars[g_polarList.count].name, token, sizeof(g_polarList.polars[g_polarList.count].name) - 1);
+    g_polarList.polars[g_polarList.count].name[sizeof(g_polarList.polars[g_polarList.count].name) - 1] = '\0';
+    g_polarList.polars[g_polarList.count].valid = true;
+    g_polarList.polars[g_polarList.count].pointCount = 0; // Will be filled by POLAR_DATA command
+    
+    g_polarList.count++;
+    token = strtok(NULL, ",");
+  }
+  
+  free(dataCopy);
+  g_polarList.received = true;
+  
+  // Clean up any "POLAR" entries (duplicates or invalid entries)
+  int writeIndex = 0;
+  for (int i = 0; i < g_polarList.count; i++) {
+    const char* name = g_polarList.polars[i].name;
+    // Remove entries that are exactly "POLAR", "Polar", or empty
+    if (strcmp(name, "POLAR") != 0 && 
+        strcmp(name, "Polar") != 0 && 
+        strcmp(name, "polar") != 0 &&
+        strlen(name) > 0) {
+      if (writeIndex != i) {
+        // Move this polar to the write position
+        g_polarList.polars[writeIndex] = g_polarList.polars[i];
+      }
+      writeIndex++;
+    } else {
+      Serial.printf("[POLARS] Removed invalid polar entry: '%s' at index %d\n", name, i);
+    }
+  }
+  g_polarList.count = writeIndex;
+  
+  Serial.printf("[POLARS] Received %d polars from sensor (after cleanup)\n", g_polarList.count);
+  for (int i = 0; i < g_polarList.count; i++) {
+    Serial.printf("[POLARS] [%d] %s\n", i, g_polarList.polars[i].name);
+  }
+  
+  // If we receive polar list, sensor is definitely connected
+  if (!g_polarLoading.sensorConnected) {
+    Serial.println("[POLARS] Received polar list - setting sensorConnected = true");
+    g_polarLoading.sensorConnected = true;
+  }
+  
+  // Update loading state
+  g_polarLoading.polarListReceived = true;
+  g_polarLoading.expectedPolars = g_polarList.count;
+  g_polarLoading.receivedPolars = 0;
+  g_polarLoading.progress = 0.1f;  // 10% for receiving the list
+  
+  Serial.printf("[POLARS] Updated expected polars: %d (from list count)\n", g_polarLoading.expectedPolars);
+}
+
+// Parse chunked polar data from CSV command
+// Format: POLAR_DATA_CHUNK,chunkNum,totalChunks,polar1Name,point1Speed,point1Sink,point2Speed,point2Sink,...,polar2Name,...
+static void parsePolarDataChunk(const char* line) {
+  Serial.printf("[PARSE] parsePolarDataChunk called with: %s\n", line);
+  
+  // Expected format: "POLAR_DATA_CHUNK,chunkNum,totalChunks,polar1Name,point1Speed,point1Sink,..."
+  if (strncmp(line, "POLAR_DATA_CHUNK,", 17) != 0) {
+    Serial.printf("[PARSE] Not a POLAR_DATA_CHUNK command: %s\n", line);
+    return;
+  }
+  
+  // Make a copy for parsing
+  char* dataCopy = strdup(line);
+  if (!dataCopy) {
+    Serial.println("[PARSE] Memory allocation failed");
+    return;
+  }
+  
+  // Skip "POLAR_DATA_CHUNK,"
+  char* token = strtok(dataCopy, ",");
+  if (!token) {
+    Serial.println("[PARSE] Failed to parse command");
+    free(dataCopy);
+    return;
+  }
+  
+  // Parse chunk number
+  token = strtok(NULL, ",");
+  if (!token) {
+    Serial.println("[PARSE] Failed to parse chunk number");
+    free(dataCopy);
+    return;
+  }
+  int chunkNum = atoi(token);
+  
+  // Parse total chunks
+  token = strtok(NULL, ",");
+  if (!token) {
+    Serial.println("[PARSE] Failed to parse total chunks");
+    free(dataCopy);
+    return;
+  }
+  int totalChunks = atoi(token);
+  
+  Serial.printf("[PARSE] Processing chunk %d of %d\n", chunkNum, totalChunks);
+  
+  // If this is the first chunk, just reset the loading counters (don't reset the polar list!)
+  if (chunkNum == 1) {
+    g_polarLoading.receivedPolars = 0;
+    g_polarLoading.expectedPolars = 0;
+    Serial.println("[PARSE] First chunk - resetting loading counters only");
+  }
+  
+  // Parse polar data from this chunk using a different approach
+  int polarsInChunk = 0;
+  
+  // Find all polar names in the chunk data by searching for known polar names
+  for (int i = 0; i < g_polarList.count; i++) {
+    char* polarName = g_polarList.polars[i].name;
+    
+    // Look for this polar name in the chunk data
+    char* polarStart = strstr(line, polarName);
+    if (polarStart == NULL) continue; // This polar is not in this chunk
+    
+    // Find the position of this polar name in the chunk
+    // Skip the command prefix: "POLAR_DATA_CHUNK,chunkNum,totalChunks,"
+    char* dataStart = strstr(line, ",");
+    dataStart = strstr(dataStart + 1, ",");
+    dataStart = strstr(dataStart + 1, ",");
+    dataStart = dataStart + 1; // Skip the comma
+    
+    // Check if this polar name appears after the command prefix
+    if (polarStart < dataStart) continue;
+    
+    // Parse the speed/sink data for this polar
+    char* currentPos = polarStart + strlen(polarName);
+    if (*currentPos != ',') continue; // Invalid format
+    currentPos++; // Skip the comma
+    
+    int pointCount = 0;
+    while (pointCount < 10) { // Max 10 points per polar
+      // Find the next comma (end of speed value)
+      char* speedEnd = strchr(currentPos, ',');
+      if (speedEnd == NULL) break;
+      *speedEnd = '\0'; // Temporarily null-terminate
+      float speed = atof(currentPos);
+      *speedEnd = ','; // Restore the comma
+      
+      currentPos = speedEnd + 1;
+      
+      // Find the next comma (end of sink value)
+      char* sinkEnd = strchr(currentPos, ',');
+      if (sinkEnd == NULL) break;
+      *sinkEnd = '\0'; // Temporarily null-terminate
+      float sink = atof(currentPos);
+      *sinkEnd = ','; // Restore the comma
+      
+      // Check if the next token looks like a polar name (not a number)
+      currentPos = sinkEnd + 1;
+      char* nextComma = strchr(currentPos, ',');
+      if (nextComma != NULL) {
+        *nextComma = '\0'; // Temporarily null-terminate
+        // If the next token doesn't contain a decimal point and is longer than 2 chars, it's likely a polar name
+        if (strchr(currentPos, '.') == NULL && strlen(currentPos) > 2) {
+          *nextComma = ','; // Restore the comma
+          break; // This is the next polar name
+        }
+        *nextComma = ','; // Restore the comma
+      }
+      
+      g_polarList.polars[i].speeds[pointCount] = speed;
+      g_polarList.polars[i].sinks[pointCount] = sink;
+      pointCount++;
+    }
+    
+    g_polarList.polars[i].pointCount = pointCount;
+    g_polarList.polars[i].valid = true;
+    polarsInChunk++;
+    
+    Serial.printf("[PARSE] Chunk %d: Added polar %d (%s) with %d points\n", 
+                  chunkNum, i, polarName, pointCount);
+  }
+  
+  // Update loading state
+  g_polarLoading.receivedPolars += polarsInChunk;
+  g_polarLoading.expectedPolars = g_polarList.count; // Will be updated as we receive more chunks
+  
+  // If this is the last chunk, we're done
+  if (chunkNum == totalChunks) {
+    g_polarLoading.progress = 1.0f;
+    g_polarList.received = true;
+    Serial.printf("[PARSE] Last chunk received! Total polars: %d\n", g_polarList.count);
+  } else {
+    // Calculate progress based on chunks received
+    g_polarLoading.progress = (float)chunkNum / (float)totalChunks;
+  }
+  
+  Serial.printf("[PARSE] Chunk %d complete: %d polars in chunk, %d total polars, progress=%.2f\n", 
+                chunkNum, polarsInChunk, g_polarList.count, g_polarLoading.progress);
+  
+  free(dataCopy);
+}
+
+// Parse polar data points from CSV command
+static void parsePolarData(const char* line) {
+  Serial.printf("[PARSE] parsePolarData called with: %s\n", line);
+  // Expected format: "POLAR_DATA,index,speed1,sink1,speed2,sink2,..."
+  if (strncmp(line, "POLAR_DATA,", 11) != 0) {
+    Serial.println("[PARSE] Line doesn't start with POLAR_DATA, - ignoring");
+    return;
+  }
+  Serial.println("[PARSE] Line format OK, proceeding with parsing");
+  
+  const char* data = line + 11; // Skip "POLAR_DATA,"
+  char* dataCopy = strdup(data);
+  
+  // Parse index
+  char* token = strtok(dataCopy, ",");
+  if (token == NULL) {
+    Serial.println("[PARSE] No token found for index");
+    free(dataCopy);
+    return;
+  }
+  
+  int index = atoi(token);
+  Serial.printf("[PARSE] Parsed index: %d, polarList.count: %d\n", index, g_polarList.count);
+  if (index < 0) {
+    Serial.printf("[PARSE] Index %d is negative, ignoring\n", index);
+    free(dataCopy);
+    return;
+  }
+  
+  // Allow polar data for indices beyond the initial list count
+  if (index >= g_polarList.count) {
+    Serial.printf("[PARSE] Index %d beyond initial list (%d), but allowing it\n", index, g_polarList.count);
+  }
+  
+  // Parse speed/sink pairs
+  // For indices beyond the initial list, we'll just track the count but not store the data
+  if (index < g_polarList.count) {
+    PolarData* polar = &g_polarList.polars[index];
+    polar->pointCount = 0;
+    
+    while (polar->pointCount < 10) {
+      token = strtok(NULL, ",");
+      if (token == NULL) break;
+      polar->speeds[polar->pointCount] = atof(token);
+      
+      token = strtok(NULL, ",");
+      if (token == NULL) break;
+      polar->sinks[polar->pointCount] = atof(token);
+      
+      polar->pointCount++;
+    }
+    
+    Serial.printf("[POLAR_DATA] Polar %d (%s): %d points\n", 
+                  index, polar->name, polar->pointCount);
+  } else {
+    // For indices beyond the list, just parse and discard the data
+    Serial.printf("[POLAR_DATA] Polar %d: data received but not stored (beyond list)\n", index);
+    
+    int pointCount = 0;
+    while (pointCount < 10) {
+      token = strtok(NULL, ",");
+      if (token == NULL) break;
+      float speed = atof(token);
+      (void)speed;  // Mark as used to avoid warning
+      
+      token = strtok(NULL, ",");
+      if (token == NULL) break;
+      float sink = atof(token);
+      (void)sink;  // Mark as used to avoid warning
+      
+      pointCount++;
+    }
+    Serial.printf("[POLAR_DATA] Polar %d: %d points (discarded)\n", index, pointCount);
+  }
+  
+  free(dataCopy);
+  
+  // If we receive polar data, sensor is definitely connected
+  if (!g_polarLoading.sensorConnected) {
+    Serial.println("[POLARS] Received polar data - setting sensorConnected = true");
+    g_polarLoading.sensorConnected = true;
+  } else {
+    Serial.println("[POLARS] Received polar data - sensorConnected already true");
+  }
+  
+  // Update expected count if we receive data for a higher index
+  if (index >= g_polarLoading.expectedPolars) {
+    g_polarLoading.expectedPolars = index + 1;  // +1 because index is 0-based
+    Serial.printf("[POLARS] Updated expected polars to %d (based on received index %d)\n", 
+                  g_polarLoading.expectedPolars, index);
+  }
+  
+  // If we haven't received a POLARS command yet, but we're getting POLAR_DATA,
+  // assume the sensor is sending data for all polars it has
+  if (!g_polarLoading.polarListReceived && g_polarLoading.expectedPolars > g_polarList.count) {
+    Serial.printf("[POLARS] No POLARS command received, but got data for index %d. Assuming %d total polars.\n", 
+                  index, g_polarLoading.expectedPolars);
+    g_polarList.count = g_polarLoading.expectedPolars;
+    g_polarLoading.polarListReceived = true;
+  }
+  
+  // Update the actual polar list count to match what we're receiving
+  if (g_polarLoading.expectedPolars > g_polarList.count) {
+    g_polarList.count = g_polarLoading.expectedPolars;
+    Serial.printf("[POLARS] Updated polar list count to %d (based on expected polars)\n", g_polarList.count);
+  }
+  
+  // Update loading progress
+  g_polarLoading.receivedPolars++;
+  if (g_polarLoading.expectedPolars > 0) {
+    g_polarLoading.progress = 0.1f + (0.9f * g_polarLoading.receivedPolars / g_polarLoading.expectedPolars);
+  }
+  
+  // Update timestamp for last polar received (used for timeout detection)
+  g_lastPolarReceived = millis();
+  
+  Serial.printf("[POLARS] Progress: received=%d, expected=%d, progress=%.2f\n", 
+                g_polarLoading.receivedPolars, g_polarLoading.expectedPolars, g_polarLoading.progress);
+  
+  // Check if all polars are loaded
+  if (g_polarLoading.receivedPolars >= g_polarLoading.expectedPolars) {
+    Serial.println("[POLARS] All polar data loaded successfully!");
+    g_polarLoading.progress = 1.0f;
+  }
+}
+
+// Calculate optimal speed from polar data
+static float calculateOptimalSpeed(int polarIndex, float vario) {
+  if (!g_polarList.received || polarIndex >= g_polarList.count) {
+    return 0.0f; // No polar data available
+  }
+  
+  PolarData* polar = &g_polarList.polars[polarIndex];
+  if (polar->pointCount < 2) {
+    return 0.0f; // Insufficient polar data
+  }
+  
+  // Find the speed that gives the best glide ratio for the current vario
+  float bestSpeed = polar->speeds[0];
+  float bestGlideRatio = 0.0f;
+  
+  for (int i = 0; i < polar->pointCount; i++) {
+    float speed = polar->speeds[i];
+    float sink = polar->sinks[i];
+    
+    // Calculate glide ratio (speed / sink rate)
+    if (sink > 0.0f) {
+      float glideRatio = speed / sink;
+      
+      // For positive vario, we want the best glide ratio
+      // For negative vario, we want to minimize sink rate
+      if (vario >= 0.0f && glideRatio > bestGlideRatio) {
+        bestGlideRatio = glideRatio;
+        bestSpeed = speed;
+      } else if (vario < 0.0f && sink < bestGlideRatio) {
+        bestGlideRatio = sink;
+        bestSpeed = speed;
+      }
+    }
+  }
+  
+  return bestSpeed;
+}
 
 // ===================================================================
 // =================== Telemetry Processing ==========================
@@ -466,6 +942,136 @@ static Altimeter gAlt;
 static ASI       gASI;
 
 // ===================================================================
+// =================== Startup Screens ================================
+// ===================================================================
+
+// QNH Entry Screen
+struct QNHEntryState {
+  bool active = false;
+  uint32_t qnhPa = 101325;  // Default 1013.25 hPa
+  int cursorPos = 0;  // 0-3 for digits (1013)
+  bool editing = false;
+  char displayValue[5] = "1013";  // Display string (4 digits)
+  uint32_t lastTouchTime = 0;  // For debouncing
+} g_qnhEntry;
+
+static void handleStartupSequence() {
+  uint32_t now = millis();
+  uint32_t elapsed = 0;  // Declare outside switch to avoid jump errors
+  
+  static uint32_t lastDebugTime = 0;
+  if (now - lastDebugTime > 3000) {  // Debug every 3 seconds to reduce overhead
+    lastDebugTime = now;
+    Serial.printf("[STARTUP] State: %d, sensorConnected: %d, progress: %.2f\n", 
+                  startupSettings.currentState, g_polarLoading.sensorConnected, g_polarLoading.progress);
+  }
+  
+  switch (startupSettings.currentState) {
+    case STARTUP_CONNECTING:
+      // Check if sensor is connected
+      if (g_polarLoading.sensorConnected) {
+        Serial.println("[STARTUP] Sensor connected, requesting polar data...");
+        startupSettings.currentState = STARTUP_LOADING_POLARS;
+        g_polarLoading.loadingStartTime = now;
+        Serial.println("[STARTUP] Sending GET_POLARS command...");
+        csv.sendGetPolars();
+        return;
+      }
+      
+      // Check for timeout
+      if (now - g_polarLoading.connectionStartTime > g_polarLoading.connectionTimeout) {
+        g_polarLoading.connectionAttempts++;
+        if (g_polarLoading.connectionAttempts >= g_polarLoading.maxConnectionAttempts) {
+          Serial.println("[STARTUP] Connection failed, using fallback polars");
+          startupSettings.currentState = STARTUP_QNH_ENTRY;
+          g_qnhEntry.active = true;
+        } else {
+          Serial.printf("[STARTUP] Connection timeout, retry %d/%d\n", 
+                        g_polarLoading.connectionAttempts, g_polarLoading.maxConnectionAttempts);
+          g_polarLoading.connectionStartTime = now;
+        }
+      }
+      break;
+      
+    case STARTUP_LOADING_POLARS:
+      // Check if all polar data is loaded
+      if (g_polarLoading.progress >= 1.0f) {
+        Serial.println("[STARTUP] Polar data loaded, proceeding to QNH entry");
+        startupSettings.currentState = STARTUP_QNH_ENTRY;
+        g_qnhEntry.active = true;
+        return;
+      }
+      
+      // Only move to next screen when ALL polar data is loaded
+      if (g_polarLoading.progress >= 1.0f) {
+        Serial.printf("[STARTUP] All polar data loaded: received=%d, expected=%d, elapsed=%dms\n", 
+                      g_polarLoading.receivedPolars, g_polarLoading.expectedPolars, elapsed);
+        startupSettings.currentState = STARTUP_QNH_ENTRY;
+        g_qnhEntry.active = true;
+        return;
+      }
+      
+      // If we haven't received any new polar data for 5 seconds, assume sensor is done
+      if (g_polarLoading.receivedPolars > 0 && g_lastPolarReceived > 0 && now - g_lastPolarReceived > 5000) {
+        Serial.printf("[STARTUP] No new polar data for 5 seconds, assuming complete: received=%d, expected=%d\n", 
+                      g_polarLoading.receivedPolars, g_polarLoading.expectedPolars);
+        
+        // If we received a reasonable number of polars (even if not all 83), proceed
+        if (g_polarLoading.receivedPolars >= 20) {
+          Serial.printf("[STARTUP] Received %d polars, proceeding to QNH entry\n", g_polarLoading.receivedPolars);
+          startupSettings.currentState = STARTUP_QNH_ENTRY;
+          g_qnhEntry.active = true;
+          return;
+        } else {
+          Serial.println("[STARTUP] Not enough polars received, using fallback list");
+          g_polarList.count = 8; // Use fallback count
+          g_polarLoading.expectedPolars = 8;
+          startupSettings.currentState = STARTUP_QNH_ENTRY;
+          g_qnhEntry.active = true;
+          return;
+        }
+      }
+      
+      // Check for absolute timeout (5 minutes max) to prevent infinite waiting
+      elapsed = now - g_polarLoading.loadingStartTime;
+      if (elapsed > 300000) { // 5 minutes absolute maximum
+        Serial.printf("[STARTUP] Absolute timeout reached: received=%d, expected=%d, elapsed=%dms\n", 
+                      g_polarLoading.receivedPolars, g_polarLoading.expectedPolars, elapsed);
+        
+        // If we didn't receive enough polars, use fallback
+        if (g_polarLoading.receivedPolars < 5) {
+          Serial.println("[STARTUP] Not enough polars received, using fallback list");
+          g_polarList.count = 8; // Use fallback count
+          g_polarLoading.expectedPolars = 8;
+        }
+        
+        startupSettings.currentState = STARTUP_QNH_ENTRY;
+        g_qnhEntry.active = true;
+      }
+      break;
+      
+    case STARTUP_QNH_ENTRY:
+    case STARTUP_POLAR_SELECTION:
+      // These are handled by user interaction
+      break;
+      
+    case STARTUP_COMPLETE:
+      // Startup is complete
+      break;
+  }
+}
+
+// Polar Selection Screen  
+struct PolarSelectionState {
+  bool active = false;
+  int selectedIndex = 0;
+  int scrollOffset = 0;
+  int visibleItems = 6;  // Show 6 items at a time
+  bool dropdownOpen = false;
+  uint32_t lastTouchTime = 0;  // For debouncing
+} g_polarSelection;
+
+// ===================================================================
 // =================== Polar Settings UI =============================
 // ===================================================================
 
@@ -492,6 +1098,302 @@ static void drawButton(TFT_eSprite& s, int x, int y, int w, int h, const char* l
   s.fillRect(x, y, w, h, bg);
   s.drawRect(x, y, w, h, C_WHITE);
   drawTextCentered2(s, label, x + w/2, y + h/2, 2, fg);
+}
+
+// ===================================================================
+// =================== Connecting to Sensor Screen ==================
+// ===================================================================
+
+static void drawConnectingToSensorScreen() {
+  spr.fillSprite(C_BLACK);
+  
+  // Title
+  drawTextCentered2(spr, "CONNECTING TO SENSOR", LCD_W/2, 50, 3, C_YELLOW);
+  
+  // Status message
+  if (g_polarLoading.connectionAttempts > 0) {
+    char statusMsg[64];
+    snprintf(statusMsg, sizeof(statusMsg), "Attempt %d of %d", 
+             g_polarLoading.connectionAttempts, g_polarLoading.maxConnectionAttempts);
+    drawTextCentered2(spr, statusMsg, LCD_W/2, 100, 2, C_WHITE);
+  }
+  
+  // Main message
+  drawTextCentered2(spr, "Searching for", LCD_W/2, 140, 2, C_WHITE);
+  drawTextCentered2(spr, "sensor board...", LCD_W/2, 160, 2, C_WHITE);
+  
+  // Spinning indicator
+  static uint32_t lastSpinTime = 0;
+  static int spinFrame = 0;
+  uint32_t now = millis();
+  if (now - lastSpinTime > 200) {  // 200ms per frame
+    lastSpinTime = now;
+    spinFrame = (spinFrame + 1) % 8;
+  }
+  
+  int centerX = LCD_W / 2;
+  int centerY = 220;
+  int radius = 20;
+  
+  // Draw spinning dots
+  for (int i = 0; i < 8; i++) {
+    float angle = (i * 45.0f) + (spinFrame * 45.0f);
+    float x = centerX + radius * cos(angle * PI / 180.0f);
+    float y = centerY + radius * sin(angle * PI / 180.0f);
+    
+    uint16_t color = (i == 0) ? C_WHITE : C_DGREY;
+    spr.fillCircle(x, y, 3, color);
+  }
+  
+  // Timeout warning
+  uint32_t elapsed = millis() - g_polarLoading.connectionStartTime;
+  if (elapsed > 5000) {  // Show warning after 5 seconds
+    drawTextCentered2(spr, "Taking longer than expected...", LCD_W/2, 280, 2, C_ORANGE);
+  }
+  
+  lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
+}
+
+// ===================================================================
+// =================== Loading Polar Data Screen ====================
+// ===================================================================
+
+static void drawLoadingPolarDataScreen() {
+  static uint32_t lastDrawTime = 0;
+  uint32_t now = millis();
+  if (now - lastDrawTime > 2000) {  // Debug every 2 seconds to reduce overhead
+    lastDrawTime = now;
+    Serial.printf("[LOADING] Drawing loading screen: received=%d, expected=%d, progress=%.2f\n", 
+                  g_polarLoading.receivedPolars, g_polarLoading.expectedPolars, g_polarLoading.progress);
+  }
+  
+  spr.fillSprite(C_BLACK);
+  
+  // Title
+  drawTextCentered2(spr, "LOADING POLAR DATA", LCD_W/2, 50, 3, C_YELLOW);
+  
+  // Status message
+  if (g_polarLoading.polarListReceived) {
+    char statusMsg[64];
+    snprintf(statusMsg, sizeof(statusMsg), "Found: %d polars", g_polarLoading.expectedPolars);
+    drawTextCentered2(spr, statusMsg, LCD_W/2, 100, 2, C_WHITE);
+  } else {
+    drawTextCentered2(spr, "Receiving polar list...", LCD_W/2, 100, 2, C_WHITE);
+  }
+  
+  // Progress bar
+  int barX = LCD_W/2 - 150;
+  int barY = 160;
+  int barW = 300;
+  int barH = 30;
+  
+  // Background
+  spr.fillRect(barX, barY, barW, barH, C_DGREY);
+  spr.drawRect(barX, barY, barW, barH, C_WHITE);
+  
+  // Progress fill
+  int fillW = (int)(barW * g_polarLoading.progress);
+  if (fillW > 0) {
+    spr.fillRect(barX + 2, barY + 2, fillW - 4, barH - 4, C_GREEN);
+  }
+  
+  // Progress percentage
+  char progressText[16];
+  snprintf(progressText, sizeof(progressText), "%.0f%%", g_polarLoading.progress * 100.0f);
+  drawTextCentered2(spr, progressText, LCD_W/2, barY + barH + 20, 2, C_WHITE);
+  
+  // Detailed status
+  if (g_polarLoading.polarListReceived) {
+    char detailMsg[64];
+    snprintf(detailMsg, sizeof(detailMsg), "Loaded: %d of %d", 
+             g_polarLoading.receivedPolars, g_polarLoading.expectedPolars);
+    drawTextCentered2(spr, detailMsg, LCD_W/2, 250, 2, C_CYAN);
+  }
+  
+  // Loading animation
+  static uint32_t lastAnimTime = 0;
+  static int animFrame = 0;
+  if (now - lastAnimTime > 300) {
+    lastAnimTime = now;
+    animFrame = (animFrame + 1) % 4;
+  }
+  
+  const char* animChars[] = {"|", "/", "-", "\\"};
+  drawTextCentered2(spr, animChars[animFrame], LCD_W/2, 300, 3, C_YELLOW);
+  
+  lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
+}
+
+// ===================================================================
+// =================== QNH Entry Screen ===============================
+// ===================================================================
+
+static void drawQNHEntryScreen() {
+  spr.fillSprite(C_BLACK);
+  
+  // Title - moved up to avoid circular edge
+  drawTextCentered2(spr, "QNH SETTING", LCD_W/2, 25, 3, C_YELLOW);
+  drawTextCentered2(spr, "Enter barometric pressure", LCD_W/2, 50, 2, C_WHITE);
+  
+  // Current QNH display
+  char qnhStr[16];
+  snprintf(qnhStr, sizeof(qnhStr), "%s hPa", g_qnhEntry.displayValue);
+  
+  // QNH value box - centered and smaller
+  int qnhBoxX = LCD_W/2 - 60;
+  int qnhBoxY = 75;
+  int qnhBoxW = 120;
+  int qnhBoxH = 50;
+  
+  spr.fillRect(qnhBoxX, qnhBoxY, qnhBoxW, qnhBoxH, C_BLACK);
+  spr.drawRect(qnhBoxX, qnhBoxY, qnhBoxW, qnhBoxH, C_WHITE);
+  drawTextCentered2(spr, qnhStr, LCD_W/2, qnhBoxY + qnhBoxH/2, 3, C_CYAN);
+  
+  // Cursor indicator
+  if (g_qnhEntry.editing) {
+    int cursorX = qnhBoxX + 15 + (g_qnhEntry.cursorPos * 25);
+    spr.fillRect(cursorX, qnhBoxY + 8, 2, qnhBoxH - 16, C_YELLOW);
+  }
+  
+  // Numeric keypad - 3x3 layout with better spacing
+  const char* keys[3][3] = {
+    {"1", "2", "3"},
+    {"4", "5", "6"}, 
+    {"7", "8", "9"}
+  };
+  
+  int keyW = 70, keyH = 50;
+  int keySpacing = 15;
+  int startX = (LCD_W - (3 * keyW + 2 * keySpacing)) / 2;
+  int startY = 140;
+  
+  // Draw number buttons
+  for (int row = 0; row < 3; row++) {
+    for (int col = 0; col < 3; col++) {
+      int x = startX + col * (keyW + keySpacing);
+      int y = startY + row * (keyH + keySpacing);
+      
+      spr.fillRect(x, y, keyW, keyH, C_DGREY);
+      spr.drawRect(x, y, keyW, keyH, C_WHITE);
+      drawTextCentered2(spr, keys[row][col], x + keyW/2, y + keyH/2, 3, C_WHITE);
+    }
+  }
+  
+  // Zero button - centered below number pad
+  int zeroX = startX + keyW + keySpacing;
+  int zeroY = startY + 3 * (keyH + keySpacing);
+  spr.fillRect(zeroX, zeroY, keyW, keyH, C_DGREY);
+  spr.drawRect(zeroX, zeroY, keyW, keyH, C_WHITE);
+  drawTextCentered2(spr, "0", zeroX + keyW/2, zeroY + keyH/2, 3, C_WHITE);
+  
+  // Control buttons - on the right side
+  int controlX = startX + 3 * (keyW + keySpacing) + 10;
+  int controlY = startY;
+  int controlW = 60;
+  int controlH = 40;
+  
+  // DEL button
+  spr.fillRect(controlX, controlY, controlW, controlH, C_RED);
+  spr.drawRect(controlX, controlY, controlW, controlH, C_WHITE);
+  drawTextCentered2(spr, "DEL", controlX + controlW/2, controlY + controlH/2, 2, C_WHITE);
+  
+  // CLR button
+  spr.fillRect(controlX, controlY + controlH + 10, controlW, controlH, C_ORANGE);
+  spr.drawRect(controlX, controlY + controlH + 10, controlW, controlH, C_WHITE);
+  drawTextCentered2(spr, "CLR", controlX + controlW/2, controlY + controlH + 10 + controlH/2, 2, C_WHITE);
+  
+  // OK button - under DEL and CLR buttons
+  spr.fillRect(controlX, controlY + 2 * (controlH + 10), controlW, controlH, C_GREEN);
+  spr.drawRect(controlX, controlY + 2 * (controlH + 10), controlW, controlH, C_WHITE);
+  drawTextCentered2(spr, "OK", controlX + controlW/2, controlY + 2 * (controlH + 10) + controlH/2, 2, C_BLACK);
+  
+  // Instructions
+  drawTextCentered2(spr, "Range: 950-1050 hPa", LCD_W/2, LCD_H - 25, 2, C_LGREY);
+  
+  lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
+}
+
+// ===================================================================
+// =================== Polar Selection Screen ========================
+// ===================================================================
+
+static void drawPolarSelectionScreen() {
+  spr.fillSprite(C_BLACK);
+  
+  // Title - bigger text
+  drawTextCentered2(spr, "POLAR SELECTION", LCD_W/2, 20, 3, C_YELLOW);
+  drawTextCentered2(spr, "Select your glider", LCD_W/2, 50, 2, C_WHITE);
+  
+  // 3-line polar selection box - moved much further down
+  int boxX = LCD_W/2 - 180;  // Much wider box
+  int boxY = 140;  // Moved up to avoid button overlap
+  int boxW = 360;  // Much wider for 466px screen
+  int boxH = 150;  // Much taller for better visibility
+  int itemHeight = 50;  // Much taller items
+  
+  // Up chevron above the box (pointing UP) - always visible
+  int upX = LCD_W/2;
+  int upY = boxY - 50;  // Positioned relative to box
+  if (g_polarSelection.scrollOffset > 0) {
+    spr.fillTriangle(upX, upY, upX - 15, upY + 20, upX + 15, upY + 20, C_WHITE);
+  } else {
+    // Show disabled up chevron
+    spr.fillTriangle(upX, upY, upX - 15, upY + 20, upX + 15, upY + 20, C_DGREY);
+  }
+  
+  // Draw box background
+  spr.fillRect(boxX, boxY, boxW, boxH, C_BLACK);
+  spr.drawRect(boxX, boxY, boxW, boxH, C_WHITE);
+  
+  // Draw 3 polar items
+  for (int i = 0; i < 3; i++) {
+    int polarIndex = g_polarSelection.scrollOffset + i;
+    if (polarIndex >= getPolarCount()) break;
+    
+    int y = boxY + i * itemHeight;
+    bool isSelected = (polarIndex == g_polarSelection.selectedIndex);
+    
+    uint16_t bgColor = isSelected ? C_GREEN : C_WHITE;
+    uint16_t fgColor = isSelected ? C_BLACK : C_BLACK;
+    
+    // Draw item background
+    spr.fillRect(boxX + 2, y + 2, boxW - 4, itemHeight - 4, bgColor);
+    
+            // Draw polar name - bigger text
+            drawTextCentered2(spr, getPolarName(polarIndex), LCD_W/2, y + itemHeight/2, 3, fgColor);
+    
+    // Draw selection indicator
+    if (isSelected) {
+      spr.fillRect(boxX + 5, y + 5, 4, itemHeight - 10, C_YELLOW);
+    }
+  }
+  
+  // Down chevron below the box (pointing DOWN)
+  int downX = LCD_W/2;
+  int downY = boxY + boxH + 30;
+  if (g_polarSelection.scrollOffset + 3 < getPolarCount()) {
+    // Bigger down chevron
+    spr.fillTriangle(downX, downY + 25, downX - 20, downY, downX + 20, downY, C_WHITE);
+  } else {
+    // Show disabled down chevron
+    spr.fillTriangle(downX, downY + 25, downX - 20, downY, downX + 20, downY, C_DGREY);
+  }
+  
+  // Action buttons (moved down for better scrolling) - bigger buttons
+  int buttonY = LCD_H - 80;
+  int buttonW = 120;
+  int buttonH = 50;
+  int buttonSpacing = 20;
+  
+  // Back button
+  int backX = (LCD_W - (2 * buttonW + buttonSpacing)) / 2;
+  drawButton(spr, backX, buttonY, buttonW, buttonH, "BACK", C_WHITE, C_RED);
+  
+  // OK button
+  int okX = backX + buttonW + buttonSpacing;
+  drawButton(spr, okX, buttonY, buttonW, buttonH, "OK", C_BLACK, C_GREEN);
+  
+  lcd_PushColors(COL_OFF, 0, LCD_W, LCD_H, (uint16_t*)spr.getPointer());
 }
 
 static void drawSlider() {
@@ -642,6 +1544,260 @@ static void sendPolarSettingsToSensor() {
   polarSettings.settingsChanged = false;
 }
 
+static void completeStartupSequence() {
+  if (!startupSettings.startupComplete) return;
+  
+  // Send remaining settings after startup is complete
+  csv.sendSetTE(polarSettings.teCompEnabled);
+  csv.sendSetVol((uint8_t)settingsManager.settings.audio_volume);
+  csv.sendSetBri((uint8_t)map((long)settingsManager.settings.display_brightness, 0L, 255L, 0L, 10L));
+  
+  Serial.println("[STARTUP] Sequence complete - sending remaining settings");
+}
+
+// ===================================================================
+// =================== Startup Screen Touch Handlers =================
+// ===================================================================
+
+static void handleQNHTouch(int16_t x, int16_t y) {
+  // Debounce touch input
+  uint32_t now = millis();
+  if (now - g_qnhEntry.lastTouchTime < 500) { // 500ms debounce for less sensitivity
+    return;
+  }
+  g_qnhEntry.lastTouchTime = now;
+  
+  Serial.printf("[QNH] Touch at (%d, %d)\n", x, y);
+  
+  // Numeric keypad coordinates (3x3 grid)
+  int keyW = 70, keyH = 50;
+  int keySpacing = 15;
+  int startX = (LCD_W - (3 * keyW + 2 * keySpacing)) / 2;
+  int startY = 140;
+  
+  // Check number buttons (1-9)
+  if (x >= startX && x <= startX + 3 * (keyW + keySpacing) - keySpacing && 
+      y >= startY && y <= startY + 3 * (keyH + keySpacing) - keySpacing) {
+    
+    int col = (x - startX) / (keyW + keySpacing);
+    int row = (y - startY) / (keyH + keySpacing);
+    
+    if (col >= 0 && col < 3 && row >= 0 && row < 3) {
+      int digit = row * 3 + col + 1;
+      if (row == 2 && col == 2) digit = 9; // Fix for 9
+      
+      // Add digit at cursor position
+      if (g_qnhEntry.cursorPos < 4) {
+        g_qnhEntry.displayValue[g_qnhEntry.cursorPos] = '0' + digit;
+        g_qnhEntry.cursorPos++;
+        Serial.printf("[QNH] Added digit %d, cursor at %d\n", digit, g_qnhEntry.cursorPos);
+      }
+      return;
+    }
+  }
+  
+  // Zero button - centered below number pad
+  int zeroX = startX + keyW + keySpacing;
+  int zeroY = startY + 3 * (keyH + keySpacing);
+  if (x >= zeroX && x <= zeroX + keyW && y >= zeroY && y <= zeroY + keyH) {
+    if (g_qnhEntry.cursorPos < 4) {
+      g_qnhEntry.displayValue[g_qnhEntry.cursorPos] = '0';
+      g_qnhEntry.cursorPos++;
+      Serial.printf("[QNH] Added zero, cursor at %d\n", g_qnhEntry.cursorPos);
+    }
+    return;
+  }
+  
+  // Control buttons - on the right side
+  int controlX = startX + 3 * (keyW + keySpacing) + 10;
+  int controlY = startY;
+  int controlW = 60;
+  int controlH = 40;
+  
+  // DEL button
+  if (x >= controlX && x <= controlX + controlW && y >= controlY && y <= controlY + controlH) {
+    if (g_qnhEntry.cursorPos > 0) {
+      // Shift digits left from cursor position
+      for (int i = g_qnhEntry.cursorPos - 1; i < 3; i++) {
+        g_qnhEntry.displayValue[i] = g_qnhEntry.displayValue[i + 1];
+      }
+      g_qnhEntry.displayValue[3] = '0'; // Fill with zero
+      g_qnhEntry.cursorPos--;
+      Serial.printf("[QNH] Deleted digit, cursor at %d\n", g_qnhEntry.cursorPos);
+    }
+    return;
+  }
+  
+  // CLR button
+  if (x >= controlX && x <= controlX + controlW && y >= controlY + controlH + 10 && y <= controlY + 2 * controlH + 10) {
+    strcpy(g_qnhEntry.displayValue, "0000");
+    g_qnhEntry.cursorPos = 0;
+    Serial.printf("[QNH] Cleared all digits\n");
+    return;
+  }
+  
+  // OK button - under DEL and CLR buttons
+  if (x >= controlX && x <= controlX + controlW && y >= controlY + 2 * (controlH + 10) && y <= controlY + 3 * controlH + 2 * 10) {
+    // Validate QNH range
+    int qnhValue = atoi(g_qnhEntry.displayValue);
+    if (qnhValue >= 950 && qnhValue <= 1050) {
+      startupSettings.qnhPa = qnhValue * 100; // Convert to Pa
+      csv.sendSetQNH(startupSettings.qnhPa);
+      
+      // Set default polar to ASK13 (index 0 in fallback list, or find ASK13 in loaded list)
+      int ask13Index = 0; // Default to first polar (ASK13 in fallback)
+      for (int i = 0; i < g_polarList.count; i++) {
+        if (strcmp(g_polarList.polars[i].name, "ASK13") == 0) {
+          ask13Index = i;
+          break;
+        }
+      }
+      
+      startupSettings.selectedPolar = ask13Index;
+      g_polarSelection.selectedIndex = ask13Index;
+      polarSettings.selectedPolar = ask13Index;
+      strncpy(polarSettings.polarName, getPolarName(ask13Index), sizeof(polarSettings.polarName) - 1);
+      polarSettings.polarName[sizeof(polarSettings.polarName) - 1] = '\0';
+      
+      // Send polar settings to sensor
+      csv.sendSetPolar(ask13Index);
+      csv.sendSetTE(polarSettings.teCompEnabled);
+      
+      // Complete startup
+      startupSettings.currentState = STARTUP_COMPLETE;
+      startupSettings.startupComplete = true;
+      g_qnhEntry.active = false;
+      
+      Serial.printf("[STARTUP] QNH set to: %d Pa, default polar: %s (index %d)\n", 
+                   startupSettings.qnhPa, getPolarName(ask13Index), ask13Index);
+    } else {
+      Serial.printf("[QNH] Invalid range: %d (must be 950-1050)\n", qnhValue);
+    }
+    return;
+  }
+  
+  Serial.printf("[QNH] Touch not handled at (%d, %d)\n", x, y);
+}
+
+static void handlePolarSelectionTouch(int16_t x, int16_t y) {
+  // Debounce touch input
+  uint32_t now = millis();
+  if (now - g_polarSelection.lastTouchTime < 500) { // 500ms debounce for less sensitivity
+    return;
+  }
+  g_polarSelection.lastTouchTime = now;
+  
+  Serial.printf("[POLAR] Touch at (%d, %d) - Screen: %dx%d\n", x, y, LCD_W, LCD_H);
+  
+  // 3-line polar selection box - much larger for 466x466 screen
+  int boxX = LCD_W/2 - 180;  // Much wider box
+  int boxY = 140;  // Moved up to avoid button overlap
+  int boxW = 360;  // Much wider for 466px screen
+  int boxH = 150;  // Much taller for better visibility
+  int itemHeight = 50;  // Much taller items
+  
+  // Check if touch is in the 3-line box
+  Serial.printf("[POLAR] Box area: x=%d-%d, y=%d-%d\n", boxX, boxX + boxW, boxY, boxY + boxH);
+  if (x >= boxX && x <= boxX + boxW && y >= boxY && y <= boxY + boxH) {
+    int itemIndex = (y - boxY) / itemHeight;
+    int polarIndex = g_polarSelection.scrollOffset + itemIndex;
+    
+    if (polarIndex < getPolarCount()) {
+      g_polarSelection.selectedIndex = polarIndex;
+      Serial.printf("[POLAR] Selected: %s (index %d)\n", getPolarName(polarIndex), polarIndex);
+    }
+    return;
+  }
+  
+  // Up chevron area (above the box) - scrolls UP to show earlier items
+  int upX = LCD_W/2;
+  int upY = boxY - 50;  // Positioned relative to box
+  Serial.printf("[POLAR] Up chevron area: x=%d-%d, y=%d-%d\n", upX - 40, upX + 40, upY - 20, upY + 20);
+  if (x >= upX - 40 && x <= upX + 40 && y >= upY - 20 && y <= upY + 20) {
+    if (g_polarSelection.scrollOffset > 0) {
+      g_polarSelection.scrollOffset--;
+      Serial.printf("[POLAR] Scrolled up to offset %d (total polars: %d)\n", g_polarSelection.scrollOffset, getPolarCount());
+    } else {
+      Serial.printf("[POLAR] Already at top (offset: %d)\n", g_polarSelection.scrollOffset);
+    }
+    return;
+  }
+  
+  // Down chevron area (below the box) - scrolls DOWN to show later items
+  int downX = LCD_W/2;
+  int downY = boxY + boxH + 30;
+  Serial.printf("[POLAR] Down chevron area: x=%d-%d, y=%d-%d\n", downX - 60, downX + 60, downY - 30, downY + 30);
+  if (x >= downX - 60 && x <= downX + 60 && y >= downY - 30 && y <= downY + 30) {
+    if (g_polarSelection.scrollOffset + 3 < getPolarCount()) {
+      g_polarSelection.scrollOffset++;
+      Serial.printf("[POLAR] Scrolled down to offset %d (total polars: %d)\n", g_polarSelection.scrollOffset, getPolarCount());
+    }
+    return;
+  }
+  
+  // Action buttons (moved up from bottom edge) - bigger buttons
+  int buttonY = LCD_H - 80;
+  int buttonW = 120;
+  int buttonH = 50;
+  int buttonSpacing = 20;
+  int backX = (LCD_W - (2 * buttonW + buttonSpacing)) / 2;
+  int okX = backX + buttonW + buttonSpacing;
+  
+  if (y >= buttonY && y <= buttonY + buttonH) {
+    if (x >= backX && x <= backX + buttonW) { // Back button
+      if (startupSettings.startupComplete) {
+        // If we're in normal operation, go back to settings
+        g_polarSelection.active = false;
+        g_in_settings = true;
+        settingsPage = 0;
+        Serial.printf("[POLAR] Back to settings\n");
+      } else {
+        // If we're in startup, go back to QNH entry
+        startupSettings.currentState = STARTUP_QNH_ENTRY;
+        g_qnhEntry.active = true;
+        g_polarSelection.active = false;
+        Serial.printf("[POLAR] Back to QNH entry\n");
+      }
+    } else if (x >= okX && x <= okX + buttonW) { // OK button
+      if (startupSettings.startupComplete) {
+        // If we're in normal operation, just update the polar selection
+        polarSettings.selectedPolar = g_polarSelection.selectedIndex;
+        strncpy(polarSettings.polarName, getPolarName(g_polarSelection.selectedIndex), sizeof(polarSettings.polarName) - 1);
+        polarSettings.polarName[sizeof(polarSettings.polarName) - 1] = '\0';
+        polarSettings.settingsChanged = true;
+        
+        // Send to sensor
+        csv.sendSetPolar(g_polarSelection.selectedIndex);
+        
+        // Go back to settings
+        g_polarSelection.active = false;
+        g_in_settings = true;
+        settingsPage = 0;
+        
+        Serial.printf("[SETTINGS] Polar changed to: %s (index %d)\n", 
+                      getPolarName(g_polarSelection.selectedIndex), g_polarSelection.selectedIndex);
+      } else {
+        // If we're in startup, complete the startup sequence
+        startupSettings.selectedPolar = g_polarSelection.selectedIndex;
+        csv.sendSetPolar(startupSettings.selectedPolar);
+        startupSettings.currentState = STARTUP_COMPLETE;
+        startupSettings.startupComplete = true;
+        g_polarSelection.active = false;
+        
+        // Update polar settings
+        polarSettings.selectedPolar = startupSettings.selectedPolar;
+        strncpy(polarSettings.polarName, getPolarName(startupSettings.selectedPolar), sizeof(polarSettings.polarName) - 1);
+        polarSettings.polarName[sizeof(polarSettings.polarName) - 1] = '\0';
+        
+        Serial.printf("[STARTUP] Polar selected: %s (index %d)\n", 
+                      getPolarName(startupSettings.selectedPolar), startupSettings.selectedPolar);
+      }
+    }
+  }
+  
+  Serial.printf("[POLAR] Touch not handled at (%d, %d)\n", x, y);
+}
+
 static void applySettingsChanges() {
   // Apply slider changes
   if (g_slider.active) {
@@ -697,7 +1853,7 @@ static inline void drawMainScreen() {
   spr.setTextColor(modeColor, C_BLACK);
   spr.setTextSize(3);
   int modeTextWidth = strlen(modeText) * 6 * 3;
-  spr.setCursor((LCD_W - modeTextWidth) / 2, 70);
+  spr.setCursor((LCD_W - modeTextWidth) / 2, 90);
   spr.print(modeText);
 
   // Mode-specific indicators
@@ -705,19 +1861,19 @@ static inline void drawMainScreen() {
   spr.setTextColor(C_LGREY, C_BLACK);
   switch (current_flight_mode) {
     case MODE_THERMAL:
-      spr.setCursor(10, 100);
+      spr.setCursor(10, 120);
       spr.print("Thermal Entry/Exit");
       break;
     case MODE_CLIMB:
-      spr.setCursor(10, 100);
+      spr.setCursor(10, 120);
       spr.print("Climbing");
       break;
     case MODE_DESCENT:
-      spr.setCursor(10, 100);
+      spr.setCursor(10, 120);
       spr.print("Descending");
       break;
     case MODE_CRUISE:
-      spr.setCursor(10, 100);
+      spr.setCursor(10, 120);
       spr.print("Cruising");
       break;
   }
@@ -737,7 +1893,21 @@ static inline void drawMainScreen() {
 
 // NEW: Unified screen drawing function
 static void drawCurrentScreen() {
-  if (g_in_settings) {
+  // Check startup sequence first
+  if (!startupSettings.startupComplete) {
+    if (startupSettings.currentState == STARTUP_CONNECTING) {
+      drawConnectingToSensorScreen();
+    } else if (startupSettings.currentState == STARTUP_LOADING_POLARS) {
+      drawLoadingPolarDataScreen();
+    } else if (startupSettings.currentState == STARTUP_QNH_ENTRY) {
+      drawQNHEntryScreen();
+    } else if (startupSettings.currentState == STARTUP_POLAR_SELECTION) {
+      drawPolarSelectionScreen();
+    }
+  } else if (g_polarSelection.active) {
+    // Polar selection screen (when accessed from settings)
+    drawPolarSelectionScreen();
+  } else if (g_in_settings) {
     if (settingsPage == 0) {
       drawMainSettingsScreen();
     } else if (settingsPage == 3) {
@@ -759,7 +1929,12 @@ static void handleTapGesture() {
     } else if (gSwipe.yLast >= 130 && gSwipe.yLast <= 170) {
       g_selected_setting = 1; setupSlider(1);
     } else if (gSwipe.yLast >= 180 && gSwipe.yLast <= 220) {
-      g_selected_setting = 2; settingsPage = 3; Serial.println("[TOUCH] Going to polar settings");
+      g_selected_setting = 2; 
+      // Go to polar selection screen instead of polar settings
+      g_polarSelection.active = true;
+      g_polarSelection.selectedIndex = polarSettings.selectedPolar; // Set current selection
+      g_in_settings = false;
+      Serial.printf("[TOUCH] Going to polar selection screen (current: %s)\n", getPolarName(polarSettings.selectedPolar));
     } else if (gSwipe.yLast >= 230 && gSwipe.yLast <= 270) {
       g_selected_setting = 3; polarSettings.teCompEnabled = !polarSettings.teCompEnabled; polarSettings.settingsChanged = true;
       // Apply immediately
@@ -780,13 +1955,28 @@ void setup() {
 
   settingsManager.begin();
 
+  // Initialize startup sequence
+  startupSettings.currentState = STARTUP_CONNECTING;
+  startupSettings.startupComplete = false;
+  g_polarLoading.connectionStartTime = millis();
+  g_polarLoading.connectionAttempts = 0;
+  g_polarLoading.sensorConnected = false;
+  g_polarLoading.polarListReceived = false;
+  g_polarLoading.progress = 0.0f;
+  
+  // Initialize QNH entry state (will be activated later)
+  g_qnhEntry.active = false;
+  g_qnhEntry.qnhPa = 101325; // Default 1013.25 hPa
+  g_qnhEntry.cursorPos = 0;
+  strcpy(g_qnhEntry.displayValue, "1013");
+  g_polarSelection.active = false;
+  g_polarSelection.selectedIndex = 0;
+
   // Load polar settings from preferences
   ui_prefs.begin("s3ui", true);
   polarSettings.teCompEnabled = ui_prefs.getBool("teEnabled", true);
   polarSettings.selectedPolar = ui_prefs.getUInt("polarIdx", 0);
-  if (polarSettings.selectedPolar < polarNameCount) {
-    strlcpy(polarSettings.polarName, polarNames[polarSettings.selectedPolar], sizeof(polarSettings.polarName));
-  }
+  // Note: polar name will be set when polar list is received from sensor
   ui_prefs.end();
 
   // Display
@@ -812,16 +2002,60 @@ void setup() {
 
   // Handshake + settings sync
   csv.onPong = [](){ Serial.println("[DISPLAY] got PONG ✔"); };
-  csv.onHelloSensor = [](){ Serial.println("[DISPLAY] HELLO from sensor"); };
-  csv.onAck = [](const char* key, long v){ Serial.printf("[DISPLAY] ACK %s=%ld\n", key, v); };
+  csv.onHelloSensor = [](){ 
+    Serial.println("[DISPLAY] HELLO from sensor - setting sensorConnected = true");
+    g_polarLoading.sensorConnected = true;
+  };
+  csv.onAck = [](const char* key, long v){ 
+    Serial.printf("[DISPLAY] ACK %s=%ld\n", key, v);
+    
+    // Handle startup sequence acknowledgments
+    if (!startupSettings.startupComplete) {
+      if (strcmp(key, "QNH") == 0) {
+        Serial.println("[STARTUP] QNH acknowledged by sensor");
+      } else if (strcmp(key, "POLAR") == 0) {
+        Serial.println("[STARTUP] Polar acknowledged by sensor");
+      }
+    }
+  };
+  
+  // Polar list and data handlers
+  csv.onPolarList = [](const char* line) { 
+    Serial.printf("[DISPLAY] Received POLARS command: %s\n", line);
+    // If we receive polar list, sensor is definitely connected
+    if (!g_polarLoading.sensorConnected) {
+      Serial.println("[POLARS] Received polar list - setting sensorConnected = true");
+      g_polarLoading.sensorConnected = true;
+    }
+    Serial.println("[DISPLAY] Calling parsePolarList...");
+    parsePolarList(line); 
+    Serial.println("[DISPLAY] parsePolarList completed");
+  };
+  csv.onPolarData = [](const char* line) { 
+    Serial.printf("[DISPLAY] Received POLAR_DATA command: %s\n", line);
+    Serial.println("[DISPLAY] Calling parsePolarData...");
+    parsePolarData(line); 
+    Serial.println("[DISPLAY] parsePolarData completed");
+  };
+  csv.onPolarDataChunk = [](const char* line) { 
+    Serial.printf("[DISPLAY] Received POLAR_DATA_CHUNK command: %s\n", line);
+    Serial.println("[DISPLAY] Calling parsePolarDataChunk...");
+    parsePolarDataChunk(line); 
+    Serial.println("[DISPLAY] parsePolarDataChunk completed");
+  };
 
   csv.sendPing(); delay(20);
+  
+  // Only send settings after startup is complete
+  if (startupSettings.startupComplete) {
   csv.sendSetTE(polarSettings.teCompEnabled);
   csv.sendSetPolar((uint8_t)polarSettings.selectedPolar);
   csv.sendSetVol((uint8_t)settingsManager.settings.audio_volume);
   csv.sendSetBri((uint8_t)map((long)settingsManager.settings.display_brightness, 0L, 255L, 0L, 10L));
+  }
 
-  Serial.printf("[S3] Polar: %s, TE: %s, Volume: %d, Brightness(0-10): %ld\n",
+  Serial.printf("[S3] Startup: %s, Polar: %s, TE: %s, Volume: %d, Brightness(0-10): %ld\n",
+                startupSettings.startupComplete ? "COMPLETE" : "IN PROGRESS",
                 polarSettings.polarName, polarSettings.teCompEnabled ? "ON" : "OFF",
                 settingsManager.settings.audio_volume,
                 map((long)settingsManager.settings.display_brightness, 0L, 255L, 0L, 10L));
@@ -834,8 +2068,38 @@ void loop() {
   static uint32_t telemetryCount = 0;
   static bool needsRedraw = true;
 
-  // Service the CSV link
+  // Service the CSV link - call multiple times to ensure all data is processed
   csv.poll();
+  csv.poll(); // Call twice to process more data
+  csv.poll(); // Call three times to ensure buffer is empty
+  
+  // Debug: Check if we're receiving any data
+  static uint32_t lastDebugTime = 0;
+  if (millis() - lastDebugTime > 10000) { // Every 10 seconds to reduce overhead
+    lastDebugTime = millis();
+    Serial.printf("[DEBUG] Polar list status: received=%d, count=%d, using=%s\n", 
+                  g_polarList.received, g_polarList.count, 
+                  g_polarList.received ? "dynamic" : "fallback");
+  }
+  
+  // Check for stuck data in UART buffer during loading
+  if (!startupSettings.startupComplete && startupSettings.currentState == STARTUP_LOADING_POLARS) {
+    static uint32_t lastBufferCheck = 0;
+    if (millis() - lastBufferCheck > 5000) { // Check every 5 seconds during loading
+      lastBufferCheck = millis();
+      // Force a few more polls to clear any stuck data
+      for (int i = 0; i < 10; i++) {
+        csv.poll();
+      }
+      Serial.printf("[DEBUG] Forced 10 additional CSV polls during loading\n");
+    }
+  }
+  
+  // Handle startup sequence state transitions
+  if (!startupSettings.startupComplete) {
+    handleStartupSequence();
+    needsRedraw = true;  // Always redraw during startup sequence
+  }
 
   // Throttled raw RX visibility (sanity)
   static uint32_t lastRaw = 0;
@@ -928,15 +2192,31 @@ void loop() {
     else if (pressed && gSwipe.active) {
       gSwipe.xLast = x; gSwipe.yLast = y;
 
+      // Startup screens
+      if (!startupSettings.startupComplete) {
+        if (startupSettings.currentState == STARTUP_QNH_ENTRY) {
+          handleQNHTouch(x, y);
+          needsRedraw = true;
+        } else if (startupSettings.currentState == STARTUP_POLAR_SELECTION) {
+          handlePolarSelectionTouch(x, y);
+          needsRedraw = true;
+        }
+        // CONNECTING and LOADING_POLARS phases don't handle touch
+      }
+      // Polar selection screen (when accessed from settings)
+      else if (g_polarSelection.active) {
+        handlePolarSelectionTouch(x, y);
+        needsRedraw = true;
+      }
       // Slider
-      if (g_in_settings && settingsPage == 0 && g_slider.active) {
+      else if (g_in_settings && settingsPage == 0 && g_slider.active) {
         if (y >= g_slider.y_pos && y <= g_slider.y_pos + g_slider.height) {
           updateSliderFromTouch(x);
           needsRedraw = true;
         }
       }
       // Polar page
-      if (g_in_settings && settingsPage == 3) {
+      else if (g_in_settings && settingsPage == 3) {
         handlePolarTouch(x, y);
         needsRedraw = true;
       }
@@ -978,6 +2258,13 @@ void loop() {
         }
       }
     }
+  }
+
+  // Complete startup sequence if needed
+  static bool startupCompleted = false;
+  if (startupSettings.startupComplete && !startupCompleted) {
+    completeStartupSequence();
+    startupCompleted = true;
   }
 
   // Send polar settings periodically if changed

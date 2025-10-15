@@ -4,8 +4,7 @@
 			"path": "../.."
 		},
 		{
-			"name": "bareminimumpassdata",
-			"path": "../../../../bareminimumpassdata"
+			"path": "../../../../ESP32C3LinkBoard"
 		}
 	],
 	"settings": {}
