@@ -16,255 +16,149 @@ This project implements a **telemetry consumer** that receives flight data from 
 - **Flight Mode Detection**: Automatic detection of thermal, cruise, climb, and descent modes
 - **Settings Management**: Persistent storage of user preferences
 
-## 🛠️ Hardware Requirements
+## 🛠️ Vario Hardware Requirements
 
 ### Primary Hardware
-- **ESP32-S3** microcontroller (16MB flash, PSRAM enabled)
-- **Waveshare 1.75" AMOLED Round TFT Display** (466x466 pixels)
-- **CST92xx Touch Controller** (capacitive touch)
-- **ES8311 Audio Codec** (I2S audio output)
-- **External Sensor Unit** (provides telemetry via UART)
+- **Waveshare ESP32-S3 1.75" AMOLED Round TFT Display** (16MB flash, PSRAM enabled, 466x466 pixels)
+   - **CST92xx Touch Controller** (capacitive touch)
+   - **ES8311 Audio Codec** (I2S audio output)
+   - **External Sensor Unit** (provides telemetry via UART)
 
-### Pin Configuration
-```
-Display (QSPI):
-- CS: GPIO12
-- SCK: GPIO38  
-- D0-D3: GPIO4-7
-- RST: GPIO39
+### 🛩️ **Intelligent Flight Detection**
+- **Automatic flight detection** when airspeed exceeds 20 kts for 3 seconds
+- **Debounced logic** prevents false triggers from brief speed spikes
+- **Multi-mode airspeed calculation** adapts to different flight phases
 
-Touch (I2C):
-- SDA: GPIO15
-- SCL: GPIO14
-- INT: GPIO11
-- RST: GPIO40
+### 📊 **Advanced Airspeed Calculation**
+- **Hybrid algorithm** combines GPS groundspeed with glider polar curves
+- **Wind drift compensation** calculates airspeed from groundspeed and bearing
+- **Flight mode detection** (Cruise, Thermal, Climb, Descent) optimizes calculations
+- **Thermal optimization** uses GPS groundspeed when circling (wind cancels out)
 
-Audio (I2S):
-- BCLK: GPIO9
-- WS: GPIO45
-- DO: GPIO8
-- MCLK: GPIO42
-- PA: GPIO46
+### 📝 **Automatic Flight Logging**
+- **IGC file generation** with standard format for flight analysis software
+- **Automatic start/stop** based on flight detection
+- **Comprehensive headers** including pilot, glider, and competition information
+- **GPS track logging** with pressure altitude and vario data
 
-UART Link:
-- RX: GPIO44 (from sensor TX)
-- TX: GPIO43 (to sensor RX)
-```
+### 🔧 **Configuration & Control**
+- **BLE interface** for wireless configuration from mobile devices
+- **Persistent settings** stored in NVS memory
+- **Real-time telemetry** via CSV protocol to display units
+- **Multiple glider polar curves** with automatic selection
 
-## 📋 Software Architecture
+## System Behavior
 
-### Core Components
+### **Startup Sequence**
+1. **Sensor initialization** - BMP581 barometer, GPS, SD card
+2. **QNH calibration** - Automatic pressure calibration for accurate altitude
+3. **Configuration loading** - Restore pilot and glider settings
+4. **BLE advertising** - Start "FlightCore" service for mobile configuration
+5. **Boot logging** - Write system status to SD card
 
-1. **Main Application** (`main.cpp`)
-   - Telemetry processing and filtering
-   - UI rendering and touch handling
-   - Settings management
-   - Flight mode detection
+### **Flight Detection Logic**
+- **Ground phase**: No flight detection, system monitors sensors
+- **Takeoff detection**: When calculated airspeed exceeds 20 kts for 3 seconds
+- **Flight phase**: IGC logging active, continuous telemetry transmission
+- **Landing detection**: When airspeed drops below 20 kts for 10 seconds
 
-2. **Display System** (`display/CO5300.*`)
-   - AMOLED display driver
-   - Brightness control
-   - Color management
+### **Airspeed Calculation Modes**
 
-3. **Touch Interface** (`touch/`)
-   - CST92xx touch controller
-   - Gesture recognition (swipe, tap)
-   - Settings navigation
+#### **Cruise Mode**
+- Uses glider polar curve to estimate airspeed from vario readings
+- Applies wind drift compensation based on GPS bearing
+- High confidence (80%) in calculations
 
-4. **Audio System** (`driver/audio/`)
-   - ES8311 codec integration
-   - Variometer audio generation
-   - Volume control
+#### **Thermal Mode**
+- Detected when vario > 2.0 m/s and turning rate > 0.1 rad/s
+- Uses GPS groundspeed (wind effects cancel out in circles)
+- Maintains rolling average of recent airspeed values
+- Medium confidence (60%) during active turning
 
-5. **Communication** (`CsvSerial.h`)
-   - CSV-over-UART protocol
-   - Bidirectional sensor communication
-   - Settings synchronization
+#### **Climb Mode**
+- Detected when vario > 1.0 m/s
+- Uses GPS groundspeed (less wind effect in climbs)
+- Medium confidence (70%)
 
-6. **Settings Management** (`system/`)
-   - Persistent preferences storage
-   - User configuration
-   - Polar curve management
+#### **Descent Mode**
+- Detected when vario < -1.0 m/s
+- Uses polar curve calculation for accurate descent airspeed
+- High confidence (80%)
 
-### Telemetry Data Structure
-```cpp
-struct CsvTlm {
-  float netto = 0;      // Netto variometer (m/s)
-  float te = 0;         // Total Energy variometer (m/s)
-  float alt_m = 0;      // Altitude (meters)
-  float asi_kts = 0;    // Airspeed (knots)
-  int   fix = 0;        // GPS fix quality
-  int   sats = 0;       // GPS satellites
-  int   mode = 0;       // Flight mode
-  bool  fresh = false;  // Data freshness flag
-};
-```
+## Performance Expectations
 
-## 🎯 User Interface
+### **Accuracy**
+- **Altitude**: ±1 meter (barometric with Kalman filtering)
+- **Vario**: ±0.1 m/s (with thermal compensation)
+- **Airspeed**: ±2 kts (improves with flight duration as wind data accumulates)
+- **GPS**: Standard GPS accuracy (±3-5 meters)
 
-### Main Display
-- **Central Variometer**: Round gauge with needle indicating climb/descent rate
-- **Digital Altimeter**: Rolling counter display in feet
-- **Airspeed Indicator**: Digital readout in knots
-- **Flight Mode**: Prominent display of current flight phase
-- **GPS Status**: Satellite count and fix quality
-- **TE/Polar Status**: Current polar curve and compensation mode
+### **Response Times**
+- **Flight detection**: 3 seconds after exceeding 20 kts
+- **Telemetry updates**: 25 Hz (40ms intervals)
+- **IGC logging**: 1 Hz (1 second intervals)
+- **BLE configuration**: Real-time updates
 
-### Settings Interface
-Access via **swipe right** from main screen:
+### **Reliability**
+- **Automatic recovery** from sensor failures
+- **Robust flight detection** with debounced logic
+- **Persistent configuration** survives power cycles
+- **Error handling** for SD card and GPS issues
 
-1. **Volume Control**: Slider for audio volume (0-10)
-2. **Brightness Control**: Slider for display brightness (0-10)
-3. **Polar Settings**: 
-   - TE Compensation toggle
-   - Glider polar selection (LS8-b, DG-800, ASG-29, Discus)
-4. **Quick TE Toggle**: Direct toggle for Total Energy compensation
+## Data Outputs
 
-### Navigation
-- **Swipe Right**: Enter settings
-- **Swipe Left**: Exit settings
-- **Tap**: Select settings options
-- **Touch Slider**: Adjust volume/brightness
+### **IGC Flight Logs**
+- **Standard format** compatible with flight analysis software
+- **Automatic filename** with date/time stamp
+- **Complete headers** with pilot, glider, and competition data
+- **GPS track data** with pressure altitude and vario
 
-## ⚙️ Configuration
+### **CSV Telemetry**
+- **Real-time data** to display units
+- **Format**: `T,<netto>,<te>,<alt_m>,<asi_kts>,<fix>,<sats>,<mode>`
+- **Flight mode** included for display unit processing
+- **25 Hz update rate** for smooth display
 
-### Build Configuration (`platformio.ini`)
-```ini
-[env:WAVESHARE_1_75INCH_AMOLED_ROUND_TFT]
-platform = espressif32
-board = esp32s3_flash_16MB
-framework = arduino
-upload_speed = 921600
-board_build.flash_size = 16MB
-board_build.psram = enabled
-board_build.partitions = partitions.csv
-board_build.filesystem = spiffs
-```
+### **BLE Configuration**
+- **Wireless setup** from mobile devices
+- **Real-time updates** of pilot, glider, and competition data
+- **Polar curve selection** and thermal compensation settings
+- **Audio and display preferences**
 
-### Pin Configuration (`pins_config.h`)
-- QSPI display interface
-- I2C touch and audio
-- UART sensor communication
-- I2S audio output
+## System Requirements
 
-### Key Build Flags
-- `DWAVESHARE_AMOLED_1_75`: Hardware identification
-- `DES8311_AUDIO`: Audio codec support
-- `ARDUINO_USB_CDC_ON_BOOT=1`: USB serial on boot
+### **Sensor Board Hardware**
+- ESP32-S3 Mini microcontroller
+- BMP581 barometric pressure sensor
+- GPS module (UART2)
+- SD card for flight logging
+- BLE for configuration
 
-## 🔧 Dependencies
+### **Power**
+- 3.3V operation
+- Low power consumption during flight
+- Automatic power management
 
-### Core Libraries
-- **TFT_eSPI**: Display graphics library
-- **Arduino Framework**: ESP32-S3 support
-- **ESP-IDF Components**: I2S, I2C, UART drivers
+### **Environmental**
+- Operating temperature: -10°C to +60°C
+- Altitude range: 0 to 15,000 meters
+- Vario range: -10 to +10 kt/s
 
-### Custom Components
-- **CO5300 Display Driver**: AMOLED-specific optimizations
-- **CST92xx Touch Driver**: Capacitive touch support
-- **ES8311 Audio Codec**: I2S audio processing
-- **CSV Serial Protocol**: Sensor communication
+## Getting Started
 
-## 🚀 Getting Started
+1. **Power on** the system
+2. **Wait for GPS fix** (1-5 minutes first time)
+3. **Configure via BLE** using mobile app
+4. **Set glider polar** and pilot information
+5. **Ready for flight** - automatic detection and logging
 
-### 1. Hardware Setup
-1. Connect the Waveshare 1.75" AMOLED display to ESP32-S3
-2. Wire the touch controller (I2C)
-3. Connect audio codec (I2S)
-4. Establish UART link to sensor unit
+## Support
 
-### 2. Software Setup
-1. Install PlatformIO
-2. Clone this repository
-3. Install dependencies: `pio lib install`
-4. Configure pins in `pins_config.h`
-5. Build and upload: `pio run -t upload`
+For technical documentation, build instructions, wiring diagrams, and component specifications, see the [Technical Documentation](docs/technical.md) page.
 
-### 3. Sensor Integration
-The display expects telemetry in CSV format over UART:
-```
-T,netto,te,alt_m,asi_kts,fix,sats,mode
-```
-Where:
-- `netto`: Netto variometer (m/s)
-- `te`: Total Energy variometer (m/s)  
-- `alt_m`: Altitude in meters
-- `asi_kts`: Airspeed in knots
-- `fix`: GPS fix quality (0-3)
-- `sats`: GPS satellite count
-- `mode`: Flight mode (0=cruise, 1=thermal, 2=climb, 3=descent)
+---
 
-## 📊 Performance Characteristics
-
-### Display Performance
-- **Resolution**: 466x466 pixels
-- **Refresh Rate**: ~60 FPS
-- **Color Depth**: 16-bit RGB565
-- **Touch Response**: <50ms
-
-### Audio Performance
-- **Sample Rate**: 44.1kHz
-- **Bit Depth**: 16-bit
-- **Latency**: <20ms
-- **Volume Range**: 0-10 (software), 0-100% (hardware)
-
-### Telemetry Processing
-- **Update Rate**: 10-20Hz
-- **Filtering**: Median + EMA smoothing
-- **Latency**: <100ms end-to-end
-
-## 🎛️ Advanced Features
-
-### Variometer Processing
-- **Dual Streams**: Netto and Total Energy (TE) compensation
-- **Smoothing**: 9-sample median filter + exponential moving average
-- **Deadband**: 0.15 m/s for audio stability
-- **Range**: ±10 m/s with gamma correction
-
-### Flight Mode Detection
-- **Thermal Mode**: Sustained climb detection
-- **Cruise Mode**: Level flight
-- **Climb Mode**: Active climbing
-- **Descent Mode**: Sinking flight
-
-### Polar Curve Management
-- **LS8-b**: Standard training glider
-- **DG-800**: High-performance glider
-- **ASG-29**: Competition glider  
-- **Discus**: Classic glider
-
-## 🔍 Troubleshooting
-
-### Common Issues
-
-1. **Display Not Working**
-   - Check QSPI connections
-   - Verify pin configuration
-   - Ensure proper power supply
-
-2. **Touch Not Responding**
-   - Check I2C connections (SDA/SCL)
-   - Verify touch controller address
-   - Check interrupt pin configuration
-
-3. **Audio Issues**
-   - Verify I2S connections
-   - Check ES8311 initialization
-   - Ensure proper audio codec setup
-
-4. **No Telemetry Data**
-   - Check UART connections (RX/TX)
-   - Verify baud rate (115200)
-   - Check sensor unit communication
-
-### Debug Output
-Enable debug logging by setting:
-```cpp
-#define CORE_DEBUG_LEVEL=5
-```
-
-Monitor serial output at 115200 baud for diagnostic information.
-
+*FlightCore - Intelligent variometer system for modern gliding*
 ## 📝 License
 
 This project is open source. Please refer to the individual component licenses for specific terms.
