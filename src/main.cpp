@@ -183,7 +183,7 @@ static int getPolarCount() {
   return count;
 }
 
-static bool isPolarValid(int index) {
+[[maybe_unused]] static bool isPolarValid(int index) {
   if (g_polarList.received && index < g_polarList.count) {
     return g_polarList.polars[index].valid;
   }
@@ -544,7 +544,7 @@ static void parsePolarData(const char* line) {
 }
 
 // Calculate optimal speed from polar data
-static float calculateOptimalSpeed(int polarIndex, float vario) {
+[[maybe_unused]] static float calculateOptimalSpeed(int polarIndex, float vario) {
   if (!g_polarList.received || polarIndex >= g_polarList.count) {
     return 0.0f; // No polar data available
   }
@@ -897,7 +897,9 @@ public:
 private:
   float alt_ = 0.f;
   static inline void frame(TFT_eSprite& s, int x, int y, int w, int h, int t=4) {
-    if (t < 1) t = 1; if (t > w/2) t = w/2; if (t > h/2) t = h/2;
+    if (t < 1) t = 1;
+    if (t > w/2) t = w/2;
+    if (t > h/2) t = h/2;
     s.fillRect(x,         y,         w, t, C_WHITE);
     s.fillRect(x,         y + h - t, w, t, C_WHITE);
     s.fillRect(x,         y + t,     t, h - 2*t, C_WHITE);
@@ -911,7 +913,9 @@ private:
     s.fillRect(ix, iy, iw, ih, C_BLACK);
     int dCur  = (currentDigit % 10 + 10) % 10; int dPrev = (dCur + 9) % 10; int dNext = (dCur + 1) % 10;
     const int chW = 6 * textSize; const int chH = 8 * textSize; const int xText = ix + (iw - chW) / 2; const int yCenter = iy + (ih - chH) / 2;
-    if (frac < 0) frac = 0; if (frac > 1) frac = 1; const int roll = (int)lroundf(frac * chH);
+    if (frac < 0) frac = 0;
+    if (frac > 1) frac = 1;
+    const int roll = (int)lroundf(frac * chH);
     const int yPrevTop = yCenter - chH - roll; const int yCurTop  = yCenter - roll; const int yNextTop = yCenter + chH - roll;
     s.setTextWrap(false); s.setTextColor(C_WHITE, C_BLACK); s.setTextSize(textSize);
     if (fullyInside(yPrevTop, textSize, iy, ih)) { s.setCursor(xText, yPrevTop); s.print(dPrev); }
@@ -1798,7 +1802,7 @@ static void handlePolarSelectionTouch(int16_t x, int16_t y) {
   Serial.printf("[POLAR] Touch not handled at (%d, %d)\n", x, y);
 }
 
-static void applySettingsChanges() {
+[[maybe_unused]] static void applySettingsChanges() {
   // Apply slider changes
   if (g_slider.active) {
     if (g_selected_setting == 0) { // Volume
