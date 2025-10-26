@@ -1,16 +1,16 @@
-# Waveshare 1.75" AMOLED Round TFT Display - ESP32-S3 Telemetry Consumer
+# Waveshare 1.75" AMOLED Round TFT Display Vario - uses ESP32-S3 Sensor board for telemetry
 
 A sophisticated flight instrument display system built for the Waveshare 1.75" AMOLED round TFT display, designed to consume telemetry data from a glider variometer sensor and present it with a professional aviation-style interface.
 
 ## 🚁 Project Overview
 
-This project implements a **telemetry consumer** that receives flight data from a sensor unit via UART and displays it on a high-resolution round AMOLED display. The system is specifically designed for glider pilots and provides real-time variometer, altimeter, airspeed, and flight mode information with an intuitive touch interface.
+This project implements a **Vario** that receives flight data from a sensor unit via UART and displays it on a high-resolution round AMOLED display. The system is specifically designed for glider pilots and provides real-time variometer, altimeter, airspeed, and flight mode information with an intuitive touch interface.
 
 ### Key Features
 
-- **Round Instrument Display**: Professional aviation-style variometer with needle and digital readouts
-- **Real-time Telemetry**: Receives and processes flight data from external sensor
-- **Touch Interface**: Swipe gestures for settings navigation
+- **57mm Round Instrument Panel Display**: Professional aviation-style variometer with needle and digital readouts
+- **Real-time Telemetry**: Receives and processes flight data from external sensor board
+- **Touch Interface**: Swipe gestures for settings pages and baseline settings (QNH, Glider Polar)
 - **Audio Feedback**: Integrated variometer audio with volume control
 - **Polar Settings**: Configurable glider polar curves and TE compensation
 - **Flight Mode Detection**: Automatic detection of thermal, cruise, climb, and descent modes
@@ -20,8 +20,8 @@ This project implements a **telemetry consumer** that receives flight data from 
 
 ### Primary Hardware
 - **Waveshare ESP32-S3 1.75" AMOLED Round TFT Display** (16MB flash, PSRAM enabled, 466x466 pixels)
-   - **CST92xx Touch Controller** (capacitive touch)
-   - **ES8311 Audio Codec** (I2S audio output)
+   - Uses **CST92xx Touch Controller** (capacitive touch)
+   - and **ES8311 Audio Codec** (I2S audio output)
    - **External Sensor Unit** (provides telemetry via UART)
 
 ### 🛩️ **Intelligent Flight Detection**
@@ -120,14 +120,14 @@ This project implements a **telemetry consumer** that receives flight data from 
 - **25 Hz update rate** for smooth display
 
 ### **BLE Configuration**
-- **Wireless setup** from mobile devices
+- **Bluetooth setup** from mobile devices
 - **Real-time updates** of pilot, glider, and competition data
 - **Polar curve selection** and thermal compensation settings
 - **Audio and display preferences**
 
 ## System Requirements
 
-### **Sensor Board Hardware**
+### **Seperate Sensor Board Hardware**
 - ESP32-S3 Mini microcontroller
 - BMP581 barometric pressure sensor
 - GPS module (UART2)
@@ -135,7 +135,7 @@ This project implements a **telemetry consumer** that receives flight data from 
 - BLE for configuration
 
 ### **Power**
-- 3.3V operation
+- 5V operation
 - Low power consumption during flight
 - Automatic power management
 
