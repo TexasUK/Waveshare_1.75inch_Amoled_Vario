@@ -6,6 +6,8 @@ A sophisticated flight instrument display system built for the Waveshare 1.75" A
 
 This project implements a **Vario** that receives flight data from a sensor unit via UART and displays it on a high-resolution round AMOLED display. The system is specifically designed for glider pilots and provides real-time variometer, altimeter, airspeed, and flight mode information with an intuitive touch interface.
 
+![IMG_20251026_025933](https://github.com/user-attachments/assets/9de2dd73-4fdb-46ac-991c-a92b9061c463)
+
 ### Key Features
 
 - **57mm Round Instrument Panel Display**: Professional aviation-style variometer with needle and digital readouts
