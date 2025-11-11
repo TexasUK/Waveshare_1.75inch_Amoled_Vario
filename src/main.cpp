@@ -4,6 +4,7 @@
 #include <math.h>
 #include <esp_err.h>
 #include <Preferences.h>
+#include <ctype.h>
 
 // === Board/display/touch/audio ===
 #include "pins_config.h"
@@ -276,145 +277,112 @@ static void parsePolarList(const char* line) {
 
 // Parse chunked polar data from CSV command
 // Format: POLAR_DATA_CHUNK,chunkNum,totalChunks,polar1Name,point1Speed,point1Sink,point2Speed,point2Sink,...,polar2Name,...
+static bool isNumericToken(const char* s) {
+  if (!s || !*s) return false;
+  bool hasDigit = false;
+  const char* p = s;
+  if (*p == '+' || *p == '-') ++p;
+  for (; *p; ++p) {
+    if (isdigit((unsigned char)*p)) { hasDigit = true; continue; }
+    if (*p == '.') continue;
+    return false;
+  }
+  return hasDigit;
+}
+
 static void parsePolarDataChunk(const char* line) {
   Serial.printf("[PARSE] parsePolarDataChunk called with: %s\n", line);
-  
-  // Expected format: "POLAR_DATA_CHUNK,chunkNum,totalChunks,polar1Name,point1Speed,point1Sink,..."
+
+  // Expected format: "POLAR_DATA_CHUNK,chunkNum,totalChunks,polarName,speed1,sink1,...,polarName2,..."
   if (strncmp(line, "POLAR_DATA_CHUNK,", 17) != 0) {
     Serial.printf("[PARSE] Not a POLAR_DATA_CHUNK command: %s\n", line);
     return;
   }
-  
-  // Make a copy for parsing
-  char* dataCopy = strdup(line);
-  if (!dataCopy) {
-    Serial.println("[PARSE] Memory allocation failed");
-    return;
+
+  char* buf = strdup(line);
+  if (!buf) { Serial.println("[PARSE] Memory allocation failed"); return; }
+
+  // Tokenize by replacing commas with NUL in our copy
+  static const int MAX_TOK = 1024;
+  char* tokens[MAX_TOK];
+  int ntok = 0;
+  char* p = buf;
+  while (p && *p && ntok < MAX_TOK) {
+    tokens[ntok++] = p;
+    char* comma = strchr(p, ',');
+    if (!comma) break;
+    *comma = '\0';
+    p = comma + 1;
   }
-  
-  // Skip "POLAR_DATA_CHUNK,"
-  char* token = strtok(dataCopy, ",");
-  if (!token) {
-    Serial.println("[PARSE] Failed to parse command");
-    free(dataCopy);
-    return;
-  }
-  
-  // Parse chunk number
-  token = strtok(NULL, ",");
-  if (!token) {
-    Serial.println("[PARSE] Failed to parse chunk number");
-    free(dataCopy);
-    return;
-  }
-  int chunkNum = atoi(token);
-  
-  // Parse total chunks
-  token = strtok(NULL, ",");
-  if (!token) {
-    Serial.println("[PARSE] Failed to parse total chunks");
-    free(dataCopy);
-    return;
-  }
-  int totalChunks = atoi(token);
-  
+
+  if (ntok < 3) { free(buf); Serial.println("[PARSE] Not enough tokens in chunk header"); return; }
+
+  // Header: tokens[0]=POLAR_DATA_CHUNK, tokens[1]=chunkNum, tokens[2]=totalChunks
+  int chunkNum = atoi(tokens[1]);
+  int totalChunks = atoi(tokens[2]);
   Serial.printf("[PARSE] Processing chunk %d of %d\n", chunkNum, totalChunks);
-  
-  // If this is the first chunk, just reset the loading counters (don't reset the polar list!)
+
   if (chunkNum == 1) {
     g_polarLoading.receivedPolars = 0;
     g_polarLoading.expectedPolars = 0;
     Serial.println("[PARSE] First chunk - resetting loading counters only");
   }
-  
-  // Parse polar data from this chunk using a different approach
+
   int polarsInChunk = 0;
-  
-  // Find all polar names in the chunk data by searching for known polar names
-  for (int i = 0; i < g_polarList.count; i++) {
-    char* polarName = g_polarList.polars[i].name;
-    
-    // Look for this polar name in the chunk data
-    char* polarStart = strstr(line, polarName);
-    if (polarStart == NULL) continue; // This polar is not in this chunk
-    
-    // Find the position of this polar name in the chunk
-    // Skip the command prefix: "POLAR_DATA_CHUNK,chunkNum,totalChunks,"
-    char* dataStart = strstr(line, ",");
-    dataStart = strstr(dataStart + 1, ",");
-    dataStart = strstr(dataStart + 1, ",");
-    dataStart = dataStart + 1; // Skip the comma
-    
-    // Check if this polar name appears after the command prefix
-    if (polarStart < dataStart) continue;
-    
-    // Parse the speed/sink data for this polar
-    char* currentPos = polarStart + strlen(polarName);
-    if (*currentPos != ',') continue; // Invalid format
-    currentPos++; // Skip the comma
-    
-    int pointCount = 0;
-    while (pointCount < 10) { // Max 10 points per polar
-      // Find the next comma (end of speed value)
-      char* speedEnd = strchr(currentPos, ',');
-      if (speedEnd == NULL) break;
-      *speedEnd = '\0'; // Temporarily null-terminate
-      float speed = atof(currentPos);
-      *speedEnd = ','; // Restore the comma
-      
-      currentPos = speedEnd + 1;
-      
-      // Find the next comma (end of sink value)
-      char* sinkEnd = strchr(currentPos, ',');
-      if (sinkEnd == NULL) break;
-      *sinkEnd = '\0'; // Temporarily null-terminate
-      float sink = atof(currentPos);
-      *sinkEnd = ','; // Restore the comma
-      
-      // Check if the next token looks like a polar name (not a number)
-      currentPos = sinkEnd + 1;
-      char* nextComma = strchr(currentPos, ',');
-      if (nextComma != NULL) {
-        *nextComma = '\0'; // Temporarily null-terminate
-        // If the next token doesn't contain a decimal point and is longer than 2 chars, it's likely a polar name
-        if (strchr(currentPos, '.') == NULL && strlen(currentPos) > 2) {
-          *nextComma = ','; // Restore the comma
-          break; // This is the next polar name
-        }
-        *nextComma = ','; // Restore the comma
-      }
-      
-      g_polarList.polars[i].speeds[pointCount] = speed;
-      g_polarList.polars[i].sinks[pointCount] = sink;
-      pointCount++;
+
+  // Walk remaining tokens, detecting polar name then numeric pairs
+  int idx = 3; // start after header
+  while (idx < ntok) {
+    const char* nameTok = tokens[idx];
+    if (!nameTok || !*nameTok) { ++idx; continue; }
+
+    // Find polar index by exact name match
+    int pi = -1;
+    for (int i = 0; i < g_polarList.count; ++i) {
+      if (strcmp(g_polarList.polars[i].name, nameTok) == 0) { pi = i; break; }
     }
-    
-    g_polarList.polars[i].pointCount = pointCount;
-    g_polarList.polars[i].valid = true;
-    polarsInChunk++;
-    
-    Serial.printf("[PARSE] Chunk %d: Added polar %d (%s) with %d points\n", 
-                  chunkNum, i, polarName, pointCount);
+
+    if (pi < 0) { // Unknown token; skip
+      ++idx;
+      continue;
+    }
+
+    ++idx; // move to first possible speed
+    int pointCount = 0;
+    while ((idx + 1) < ntok && isNumericToken(tokens[idx]) && isNumericToken(tokens[idx + 1])) {
+      float speed = atof(tokens[idx]);
+      float sink  = atof(tokens[idx + 1]);
+      if (pointCount < 10) {
+        g_polarList.polars[pi].speeds[pointCount] = speed;
+        g_polarList.polars[pi].sinks[pointCount]  = sink;
+      }
+      ++pointCount;
+      idx += 2;
+    }
+
+    g_polarList.polars[pi].pointCount = (pointCount > 10) ? 10 : pointCount;
+    g_polarList.polars[pi].valid = true;
+    ++polarsInChunk;
+    Serial.printf("[PARSE] Chunk %d: Polar %d (%s) points=%d\n", chunkNum, pi, g_polarList.polars[pi].name, g_polarList.polars[pi].pointCount);
   }
-  
+
   // Update loading state
   g_polarLoading.receivedPolars += polarsInChunk;
-  g_polarLoading.expectedPolars = g_polarList.count; // Will be updated as we receive more chunks
-  
-  // If this is the last chunk, we're done
+  g_polarLoading.expectedPolars = g_polarList.count;
+
   if (chunkNum == totalChunks) {
     g_polarLoading.progress = 1.0f;
     g_polarList.received = true;
     Serial.printf("[PARSE] Last chunk received! Total polars: %d\n", g_polarList.count);
-  } else {
-    // Calculate progress based on chunks received
+  } else if (totalChunks > 0) {
     g_polarLoading.progress = (float)chunkNum / (float)totalChunks;
   }
-  
-  Serial.printf("[PARSE] Chunk %d complete: %d polars in chunk, %d total polars, progress=%.2f\n", 
+
+  g_lastPolarReceived = millis();
+  Serial.printf("[PARSE] Chunk %d complete: polarsInChunk=%d, total=%d, progress=%.2f\n",
                 chunkNum, polarsInChunk, g_polarList.count, g_polarLoading.progress);
-  
-  free(dataCopy);
+
+  free(buf);
 }
 
 // Parse polar data points from CSV command
@@ -2005,7 +1973,11 @@ void setup() {
   Serial.printf("[S3] Link (CSV) UART1: RX=%d, TX=%d @%u\n", S3_RX, S3_TX, LINK_BAUD);
 
   // Handshake + settings sync
+  #if 0  // disable malformed onPong line inserted earlier
   csv.onPong = [](){ Serial.println("[DISPLAY] got PONG ✔"); };
+  #endif
+  // Fixed onPong callback
+  csv.onPong = [](){ Serial.println("[DISPLAY] got PONG"); };
   csv.onHelloSensor = [](){ 
     Serial.println("[DISPLAY] HELLO from sensor - setting sensorConnected = true");
     g_polarLoading.sensorConnected = true;
