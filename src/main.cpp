@@ -21,6 +21,9 @@
 
 // === CSV link (replaces LinkProtocol) ===
 #include "CsvSerial.h"
+// Extracted helpers
+#include "ui/DrawUtils.h"
+#include "utils/Filters.h"
 
 // ===================================================================
 // =================== Constants & Pins ===============================
@@ -558,6 +561,8 @@ static bool     filtersInit=false;
 static uint32_t firstFrameMs=0;
 
 // Vario smoothing
+// Use shared Filters.h for Ring median buffer
+#if 0
 template<size_t N>
 struct Ring {
   float d[N]; size_t idx=0, sz=0;
@@ -574,6 +579,7 @@ struct Ring {
     return (sz&1) ? tmp[sz/2] : 0.5f*(tmp[sz/2-1]+tmp[sz/2]);
   }
 };
+#endif
 static Ring<9> varioMed;
 static float    varioEma=0.0f, altEma=0.0f;
 
@@ -710,11 +716,7 @@ static const int ASI_FIELD_CHARS=3;
 static const int ASI_FIELD_W=ASI_FIELD_CHARS*ASI_CHAR_W;
 static const int ASI_GUTTER=0;
 
-static inline void drawTextCentered(TFT_eSprite& s, const char* str, int x, int y, int size, uint16_t fg, uint16_t bg=C_BLACK) {
-  s.setTextWrap(false); s.setTextColor(fg, bg); s.setTextSize(size);
-  int w = (int)strlen(str) * 6 * size; int h = 8 * size;
-  s.setCursor(x - w/2, y - h/2); s.print(str);
-}
+// drawTextCentered now provided by ui/DrawUtils.h
 
 static inline void getBandRadii(int &rDisplay, int &rOuter, int &rInner, int &rCenter) {
   rDisplay = min(LCD_W, LCD_H) / 2 - max(0, SHRINK);
@@ -1051,20 +1053,9 @@ struct SliderState {
   bool active=false; int value=0; int min_value=0; int max_value=10; int x_pos=0; int y_pos=0; int width=0; int height=30;
 } g_slider;
 
-static void drawRoundedRect(TFT_eSprite& s, int x, int y, int w, int h, int r, uint16_t color) {
-  s.fillCircle(x + r, y + r, r, color);
-  s.fillCircle(x + w - r - 1, y + r, r, color);
-  s.fillCircle(x + r, y + h - r - 1, r, color);
-  s.fillCircle(x + w - r - 1, y + h - r - 1, r, color);
-  s.fillRect(x + r, y, w - 2 * r, h, color);
-  s.fillRect(x, y + r, w, h - 2 * r, color);
-}
+// drawRoundedRect now provided by ui/DrawUtils.h
 
-static void drawTextCentered2(TFT_eSprite& s, const char* label, int x, int y, int size, uint16_t col){
-  s.setTextColor(col, C_BLACK); s.setTextSize(size);
-  int w = strlen(label)*6*size, h=8*size;
-  s.setCursor(x-w/2, y-h/2); s.print(label);
-}
+// drawTextCentered2 now provided by ui/DrawUtils.h
 
 static void drawButton(TFT_eSprite& s, int x, int y, int w, int h, const char* label, uint16_t fg, uint16_t bg) {
   s.fillRect(x, y, w, h, bg);
