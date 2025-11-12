@@ -561,25 +561,6 @@ static bool     filtersInit=false;
 static uint32_t firstFrameMs=0;
 
 // Vario smoothing
-// Use shared Filters.h for Ring median buffer
-#if 0
-template<size_t N>
-struct Ring {
-  float d[N]; size_t idx=0, sz=0;
-  void push(float v){ d[idx]=v; idx=(idx+1)%N; if(sz<N) sz++; }
-  float median() const {
-    if (!sz) return 0.0f;
-    float tmp[N];
-    for(size_t i=0;i<sz;++i) tmp[i]=d[i];
-    for(size_t i=1;i<sz;++i){
-      float v=tmp[i]; size_t j=i;
-      while(j>0 && tmp[j-1]>v){ tmp[j]=tmp[j-1]; --j; }
-      tmp[j]=v;
-    }
-    return (sz&1) ? tmp[sz/2] : 0.5f*(tmp[sz/2-1]+tmp[sz/2]);
-  }
-};
-#endif
 static Ring<9> varioMed;
 static float    varioEma=0.0f, altEma=0.0f;
 
@@ -1964,9 +1945,6 @@ void setup() {
   Serial.printf("[S3] Link (CSV) UART1: RX=%d, TX=%d @%u\n", S3_RX, S3_TX, LINK_BAUD);
 
   // Handshake + settings sync
-  #if 0  // disable malformed onPong line inserted earlier
-  csv.onPong = [](){ Serial.println("[DISPLAY] got PONG ✔"); };
-  #endif
   // Fixed onPong callback
   csv.onPong = [](){ Serial.println("[DISPLAY] got PONG"); };
   csv.onHelloSensor = [](){ 
